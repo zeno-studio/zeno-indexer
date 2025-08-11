@@ -1,40 +1,55 @@
-use axum::{response::Json, http::StatusCode, extract::State};
+use axum::{
+    routing::post,
+    Json,
+    Router,
+    http::{StatusCode, HeaderMap},
+    middleware::{self, Next},
+    response::IntoResponse,
+};
 use serde::{Deserialize, Serialize};
-use crate::db::postgres::PostgresDb;
+use crate::config::Config;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
 
 #[derive(Deserialize)]
-pub struct SwitchDbRequest {
-    target: String, // "master" 或 "replica"
+struct UpdateConfig {
+    primary_db_url: String,
 }
 
-#[derive(Serialize)]
-pub struct SwitchDbResponse {
-    message: String,
-    current_url: String,
-}
+pub async fn update_db_url(
+    state: axum::extract::State<Arc<RwLock<Config>>>,
+    Json(payload): Json<UpdateConfig>,
+) -> String {
+    let mut config = state.write().await;
+    match config.update_db_url(payload.primary_db_url).await {
+        Ok(()) => format!(
+            "Primary DB URL updated to: {}",
+            config.postgres_db.primary_db_url,
 
-
-pub async fn switch_db(
-    State(db): State<PostgresDb>,
-    Json(request): Json<SwitchDbRequest>,
-) -> Result<Json<SwitchDbResponse>, (StatusCode, String)> {
-    match request.target.as_str() {
-        "master" => {
-            db.switch_to_master().await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            Ok(Json(SwitchDbResponse {
-                message: "Switched to master database".to_string(),
-                current_url: db.master_url.clone(),
-            }))
-        }
-        "replica" => {
-            db.switch_to_replica().await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            Ok(Json(SwitchDbResponse {
-                message: "Switched to replica database".to_string(),
-                current_url: db.replica_url.clone(),
-            }))
-        }
-        _ => Err((StatusCode::BAD_REQUEST, "Invalid target: must be 'master' or 'replica'".to_string())),
+        ),
+        Err(e) => format!("Failed to update DB URL: {}", e),
     }
+}
+
+// API 密钥认证中间件
+pub async fn api_key_auth(
+    headers: HeaderMap,
+    state: axum::extract::State<Arc<RwLock<Config>>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let config = state.read().await;
+    let expected_api_key = config.api_key.clone();
+
+    let provided_api_key = headers
+        .get("X-API-Key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+
+    if provided_api_key != expected_api_key {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+    }
+
+    Ok(next.run(request).await)
 }

@@ -1,6 +1,9 @@
+use alloy::rpc::types::Log as RpcLog;
+
+
 #[derive(Debug, Clone)]
-pub enum SubscriptionType {
-    NewBlocks,
-    NewTransactions,
-    ContractEvents { contract_address: String, event_name: String },
+pub struct LogWithTimestamp {
+    pub timestamp: i64, 
+    pub rpclog: RpcLog,    
 }
+

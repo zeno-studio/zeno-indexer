@@ -1,94 +1,145 @@
-use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
 use serde_json::Value;
-use tokio::sync::RwLock;
-use std::sync::Arc;
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use alloy::{
+    providers::{Provider, ProviderBuilder},
+    transports::http::reqwest::Url,
+    pubsub::PubSubFrontend,
+    sol_types::SolEvent,
+    primitives::{Address, U256, B256},
+    contract::{EventFilter, Log},
+    sol,
+};
 
+#[derive(Clone)]
 pub struct PostgresDb {
-    pool: Arc<RwLock<Pool<Postgres>>>, // 当前写入的数据库连接池
-    master_url: String,
-    replica_url: String,
+    pub primary_db_url: String,
+    pool: PgPool,
 }
 
 impl PostgresDb {
-    pub async fn new(master_url: &str, replica_url: &str) -> anyhow::Result<Self> {
+    pub fn new(primary_db_url: String) -> Self {
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .connect(master_url)
+            .connect_lazy(&primary_db_url)
+            .unwrap();
+        PostgresDb {
+            primary_db_url,
+            pool,
+        }
+    }
+
+    pub async fn update_primary_db_url(&mut self, new_url: String) -> Result<(), sqlx::Error> {
+        // 健康检查：尝试连接新 URL
+
+        let new_pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&new_url)
             .await?;
-        Ok(Self {
-            pool: Arc::new(RwLock::new(pool)),
-            master_url: master_url.to_string(),
-            replica_url: replica_url.to_string(),
+
+        // 检查是否为主节点（非恢复模式）
+        let is_in_recovery: bool = sqlx::query("SELECT pg_is_in_recovery()")
+            .fetch_one(&new_pool)
+            .await?
+            .get::<bool, _>(0);
+        if is_in_recovery {
+            return Err(sqlx::Error::Configuration(
+                "New URL is a replica, not a primary database".into(),
+            ));
+        }
+
+        // 测试写入
+        sqlx::query("CREATE TEMPORARY TABLE IF NOT EXISTS health_check (id SERIAL PRIMARY KEY)")
+            .execute(&new_pool)
+            .await?;
+        sqlx::query("INSERT INTO health_check DEFAULT VALUES")
+            .execute(&new_pool)
+            .await?;
+        sqlx::query("DROP TABLE health_check")
+            .execute(&new_pool)
+            .await?;
+
+        self.primary_db_url = new_url;
+        self.pool = new_pool;
+        Ok(())
+    }
+
+ pub async fn write_transfer(
+        &self,
+        block_number: i64,
+        tx_hash: B256,
+        from: Address,
+        to: Address,
+        value: U256,
+        contract_address: Address,
+        timestamp: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO transfers (block_number, transaction_hash, from_address, to_address, value, contract_address, timestamp)
+            VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))
+            "#,
+        )
+        .bind(block_number as i64)
+        .bind(format!("{:?}", tx_hash))
+        .bind(format!("{:?}", from))
+        .bind(format!("{:?}", to))
+        .bind(value.to_string())
+        .bind(format!("{:?}", contract_address))
+        .bind(timestamp)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+ pub async fn write_approval(
+        &self,
+        block_number: i64,
+        tx_hash: B256,
+        owner: Address,
+        spender: Address,
+        value: U256,
+        contract_address: Address,
+        timestamp: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO approvals (block_number, transaction_hash, owner_address, spender_address, value, contract_address, timestamp)
+            VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))
+            "#,
+        )
+        .bind(block_number as i64)
+        .bind(format!("{:?}", tx_hash))
+        .bind(format!("{:?}", owner))
+        .bind(format!("{:?}", spender))
+        .bind(value.to_string())
+        .bind(format!("{:?}", contract_address))
+        .bind(timestamp)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+   pub async fn get_latest_block_number(&self) -> Result<Option<u64>, sqlx::Error> {
+        // 从 transfers 或 approvals 表获取最新块号
+        let transfer_block: Option<i64> = sqlx::query("SELECT MAX(block_number) FROM transfers")
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get(0));
+        let approval_block: Option<i64> = sqlx::query("SELECT MAX(block_number) FROM approvals")
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get(0));
+
+        Ok(match (transfer_block, approval_block) {
+            (Some(t), Some(a)) => Some(t.max(a) as u64),
+            (Some(t), None) => Some(t as u64),
+            (None, Some(a)) => Some(a as u64),
+            (None, None) => None,
         })
     }
+}
 
-    pub async fn switch_to_replica(&self) -> anyhow::Result<()> {
-        let new_pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&self.replica_url)
-            .await?;
-        let mut pool = self.pool.write().await;
-        *pool = new_pool;
-        tracing::info!("Switched to replica database: {}", self.replica_url);
-        Ok(())
-    }
-
-    pub async fn switch_to_master(&self) -> anyhow::Result<()> {
-        let new_pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&self.master_url)
-            .await?;
-        let mut pool = self.pool.write().await;
-        *pool = new_pool;
-        tracing::info!("Switched to master database: {}", self.master_url);
-        Ok(())
-    }
-
-    pub async fn insert_block(&self, block_number: i64, block_data: Value) -> anyhow::Result<()> {
-        let pool = self.pool.read().await;
-        sqlx::query(
-            r#"
-            INSERT INTO blocks (block_number, block_data)
-            VALUES ($1, $2)
-            ON CONFLICT (block_number) DO NOTHING
-            "#,
-        )
-        .bind(block_number)
-        .bind(block_data)
-        .execute(&*pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn insert_transaction(&self, tx_hash: &str, tx_data: Value) -> anyhow::Result<()> {
-        let pool = self.pool.read().await;
-        sqlx::query(
-            r#"
-            INSERT INTO transactions (tx_hash, tx_data)
-            VALUES ($1, $2)
-            ON CONFLICT (tx_hash) DO NOTHING
-            "#,
-        )
-        .bind(tx_hash)
-        .bind(tx_data)
-        .execute(&*pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn insert_event(&self, event_id: &str, event_data: Value) -> anyhow::Result<()> {
-        let pool = self.pool.read().await;
-        sqlx::query(
-            r#"
-            INSERT INTO events (event_id, event_data)
-            VALUES ($1, $2)
-            ON CONFLICT (event_id) DO NOTHING
-            "#,
-        )
-        .bind(event_id)
-        .bind(event_data)
-        .execute(&*pool)
-        .await?;
-        Ok(())
-    }
+sol! {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
 }
