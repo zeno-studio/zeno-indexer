@@ -120,9 +120,9 @@ pub async fn zeno_indexer(config: Arc<RwLock<Config>>) {
                 continue;
             }
         };
-
+        let provider_clone = Arc::clone(&provider);
         let transfer_stream = transfer_sub.into_stream().then(move |log| {
-            let provider = Arc::clone(&provider);
+            let provider = Arc::clone(&provider_clone);
             async move {
                 let block_number = log.block_number.unwrap_or_default();
                
@@ -141,8 +141,10 @@ pub async fn zeno_indexer(config: Arc<RwLock<Config>>) {
             }
         });
 
+        let provider_clone = Arc::clone(&provider);
+
         let approval_stream = approval_sub.into_stream().then(move |log| {
-            let provider = Arc::clone(&provider);
+            let provider = Arc::clone(&provider_clone);
             async move {
                 let block_number = log.block_number.unwrap_or_default();
                
@@ -258,4 +260,85 @@ async fn process_approval_log(
     .await?;
 
     Ok(())
+}
+
+
+ pub async fn write_transfer(
+        &self,
+        block_number: i64,
+        tx_hash: B256,
+        from: Address,
+        to: Address,
+        value: U256,
+        contract_address: Address,
+        timestamp: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO transfers (block_number, transaction_hash, from_address, to_address, value, contract_address, timestamp)
+            VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))
+            "#,
+        )
+        .bind(block_number as i64)
+        .bind(format!("{:?}", tx_hash))
+        .bind(format!("{:?}", from))
+        .bind(format!("{:?}", to))
+        .bind(value.to_string())
+        .bind(format!("{:?}", contract_address))
+        .bind(timestamp)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+ pub async fn write_approval(
+       
+        block_number: i64,
+        tx_hash: B256,
+        owner: Address,
+        spender: Address,
+        value: U256,
+        contract_address: Address,
+        timestamp: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO approvals (block_number, transaction_hash, owner_address, spender_address, value, contract_address, timestamp)
+            VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))
+            "#,
+        )
+        .bind(block_number as i64)
+        .bind(format!("{:?}", tx_hash))
+        .bind(format!("{:?}", owner))
+        .bind(format!("{:?}", spender))
+        .bind(value.to_string())
+        .bind(format!("{:?}", contract_address))
+        .bind(timestamp)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+   pub async fn get_latest_block_number() -> Result<Option<u64>, sqlx::Error> {
+        // 从 transfers 或 approvals 表获取最新块号
+        let transfer_block: Option<i64> = sqlx::query("SELECT MAX(block_number) FROM transfers")
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get(0));
+        let approval_block: Option<i64> = sqlx::query("SELECT MAX(block_number) FROM approvals")
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get(0));
+
+        Ok(match (transfer_block, approval_block) {
+            (Some(t), Some(a)) => Some(t.max(a) as u64),
+            (Some(t), None) => Some(t as u64),
+            (None, Some(a)) => Some(a as u64),
+            (None, None) => None,
+        })
+    }
+
+    sol! {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
 }
