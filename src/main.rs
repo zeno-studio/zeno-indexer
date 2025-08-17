@@ -16,19 +16,19 @@ use tracing_subscriber;
 
 mod abi;
 mod config;
-mod indexer;
 mod manage;
 mod processor;
 mod provider;
 mod subscription;
 mod wallet;
+mod worker;
 
 use abi::parser::AbiParser;
 use config::Config;
-use indexer::external::{fetch_token_metadata, sync_nftmap, sync_tokenmap};
-use manage::{ManagerRouter, manager_rpc};
+use manage::manager_rpc;
 use provider::eth::EthProvider;
 use wallet::local::Account;
+use worker::metadata::{fetch_token_metadata, sync_nftmap, sync_tokenmap};
 
 #[tokio::main]
 
@@ -46,12 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Create Config and wrap in Arc<RwLock<...>>
     let config = Arc::new(RwLock::new(Config::from_env()));
-    let config_clone = Arc::clone(&config);
-
+    {
+        let cfg = config.read().await;
+        cfg.postgres_db.init_database().await.unwrap();
+    }
     // initialize database
     {
         let cfg = config.read().await;
-        cfg.postgres_db.init_chains().await?;
+        cfg.postgres_db.init_chains_table().await.unwrap();
     }
 
     {
@@ -69,37 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    //  // 启动后台任务
-    // {
-    //     let config_clone = Arc::clone(&config);
-    //     tokio::spawn(async move {
-    //         // 0~300秒随机延迟，避免所有节点同时请求
-    //         let delay_secs = rand::thread_rng().gen_range(0..=300);
-    //         println!("⏳ First sync_tokenmap will start in {delay_secs} seconds...");
-    //         sleep(Duration::from_secs(delay_secs)).await;
-
-    //         loop {
-    //             {
-    //                 let cfg = config_clone.read().await;
-    //                 if let Err(e) = sync_tokenmap(&cfg).await {
-    //                     eprintln!("❌ sync_tokenmap failed: {e}");
-    //                 }
-    //             }
-    //             sleep(Duration::from_secs(24 * 3600)).await; // 24小时
-    //         }
-    //     });
-    // }
-
     {
         let config_clone = Arc::clone(&config);
         tokio::spawn(async move {
-            use rand::Rng;
-            use tokio::time::{Duration, sleep};
-
             let delay_secs = 300;
             println!("⏳ First sync_nftmap will start in {delay_secs} seconds...");
             sleep(Duration::from_secs(delay_secs)).await;
-
             loop {
                 {
                     let cfg = config_clone.read().await;
@@ -112,62 +89,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    // Initialize EVM Provider
-    let provider = EthProvider::new(&config_clone.read().await.eth_rpc_url).await?;
-
-    // Initialize ABI parser
-    let abi_parser = AbiParser::new(&config_clone.read().await.abi_path)?;
-
-    // Initialize subscription manager
-
-    let account = Account::from_private_key(&config_clone.read().await.private_key);
-    info!("Account address: {}", account.unwrap().wallet.address());
-
-    // 注册管理方法
-    let router = ManagerRouter::new()
-        .register("add_chain", |cfg, params| async move {
-            if let (Some(chainid), Some(name)) = (
-                params.get("chainid").and_then(|v| v.as_i64()),
-                params.get("name").and_then(|v| v.as_str()),
-            ) {
-                let cfg = cfg.read().await;
-                match cfg.postgres_db.add_chain(chainid, name).await {
-                    Ok(_) => json!({"result": "ok"}),
-                    Err(e) => json!({"error": e.to_string()}),
+    {
+        let config_clone = Arc::clone(&config);
+        tokio::spawn(async move {
+            let delay_secs = 300;
+            println!("⏳ First sync_nftmap will start in {delay_secs} seconds...");
+            sleep(Duration::from_secs(delay_secs)).await;
+            loop {
+                {
+                    let cfg = config_clone.read().await;
+                    if let Err(e) = fetch_token_metadata(&cfg).await {
+                        eprintln!("❌ fetch_token_metadata failed: {e}");
+                    }
                 }
-            } else {
-                json!({"error": "Invalid params"})
-            }
-        })
-        .register("delete_chain", |cfg, params| async move {
-            if let Some(chainid) = params.get("chainid").and_then(|v| v.as_i64()) {
-                let cfg = cfg.read().await;
-                match cfg.postgres_db.delete_chain(chainid).await {
-                    Ok(_) => json!({"result": "ok"}),
-                    Err(e) => json!({"error": e.to_string()}),
-                }
-            } else {
-                json!({"error": "Invalid params"})
-            }
-        })
-        .register("update_primary_db_url", |cfg, params| async move {
-            if let Some(new_url) = params.get("new_url").and_then(|v| v.as_str()) {
-                let mut cfg = cfg.write().await;
-                match cfg.update_db_url(new_url.to_string()).await {
-                    Ok(_) => json!({"result": "ok"}),
-                    Err(e) => json!({"error": e.to_string()}),
-                }
-            } else {
-                json!({"error": "Invalid params"})
+                sleep(Duration::from_secs(24 * 3600)).await; // 每天跑一次
             }
         });
+    }
 
+    // Initialize EVM Provider
+    let provider = EthProvider::new(&config.read().await.eth_rpc_url).await?;
 
+    // Initialize ABI parser
+    let abi_parser = AbiParser::new(&config.read().await.abi_path)?;
+
+    let account = Account::from_private_key(&config.read().await.private_key);
+    info!("Account address: {}", account.unwrap().wallet.address());
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/manager", post(manager_rpc))
-        .with_state((Arc::clone(&config), router));
+        .with_state(Arc::clone(&config));
 
     // Load TLS certificates
     let cert_path = env::var("TLS_CERT_PATH").unwrap_or("./cert.pem".to_string());

@@ -1,8 +1,9 @@
 use std::env;
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
-use reqwest::Client;
+use sqlx::{pool, postgres::PgPoolOptions, PgPool, Row};
+use reqwest::{Client,StatusCode};
 use tokio::time::Duration;
 use anyhow::Result;
+use std::fs;
 
 
 #[derive(Clone)]
@@ -58,18 +59,25 @@ impl PostgresDb {
         Ok(())
     }
 
-     pub async fn init_chains(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS chains (
-                chainid BIGINT PRIMARY KEY,
-                name TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+    pub async fn init_database(&self) -> Result<(), StatusCode> {
+        // Read schema.sql file 嵌入式 SQL：使用include_str！schema.sql包含在二进制文件中，消除运行时文件依赖性。
 
+        const SCHEMA_SQL: &str = include_str!("db/schema.sql");
+    
+        // Execute SQL statements
+        sqlx::query(&SCHEMA_SQL)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                println!("Failed to execute schema.sql: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    
+        println!("✅ Database initialized successfully from schema.sql.");
+        Ok(())
+    }
+
+     pub async fn init_chains_table(&self) -> Result<()> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chains")
             .fetch_one(&self.pool)
             .await?;
@@ -96,6 +104,9 @@ impl PostgresDb {
         Ok(())
     }
 
+ 
+        
+
     /// 添加一个链
     pub async fn add_chain(&self, chainid: i64, name: &str) -> Result<()> {
         sqlx::query("INSERT INTO chains (chainid, name) VALUES ($1, $2)")
@@ -114,11 +125,11 @@ impl PostgresDb {
             .await?;
         Ok(())
     }
-    pub async fn token_exists(&self, tokenid: &str, chainid: i64) -> Result<bool, sqlx::Error> {
+    pub async fn contract_exists(&self, address: &str, chainid: i64) -> Result<bool, sqlx::Error> {
         let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM tokenmap WHERE tokenid = $1 AND chainid = $2 LIMIT 1"
+            "SELECT 1 FROM metadata WHERE address = $1 AND chainid = $2 LIMIT 1"
         )
-        .bind(tokenid)
+        .bind(address)
         .bind(chainid)
         .fetch_optional(&self.pool)
         .await?;
@@ -126,17 +137,7 @@ impl PostgresDb {
         Ok(exists.is_some())
     }
 
-    pub async fn nft_exists(&self, nftid: &str, chainid: i64) -> Result<bool, sqlx::Error> {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM nftmap WHERE nftid = $1 AND chainid = $2 LIMIT 1"
-        )
-        .bind(nftid)
-        .bind(chainid)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(exists.is_some())
-    }
+ 
 
 }
 
@@ -149,7 +150,9 @@ pub struct Config {
     pub coingecko_key: String,
     pub private_key: String,
     pub contract_address: String,
+    pub abi_path: String,
     pub http_client: Client,
+    pub max_hot_token_page: i64,
 }
 
 impl Config {
@@ -172,7 +175,9 @@ impl Config {
             coingecko_key: env::var("COINGECKO_KEY").expect("COINGECKO_KEY must be set"),
             private_key: env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set"),
             contract_address: env::var("CONTRACT_ADDRESS").expect("CONTRACT_ADDRESS must be set"),
+            abi_path: env::var("ABI_PATH").expect("ABI_PATH must be set"),
             http_client: client,
+            max_hot_token_page: env::var("MAX_HOT_TOKEN_PAGE").expect("MAX_HOT_TOKEN_PAGE must be set").parse().unwrap(),
         }
     }
     pub async fn update_db_url(&mut self, new_url: String) -> Result<(), sqlx::Error> {
