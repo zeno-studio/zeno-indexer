@@ -48,24 +48,20 @@ CREATE TABLE IF NOT EXISTS metadata (
             UNIQUE(address, chainid)
         )
 
+
 CREATE TABLE IF NOT EXISTS hot_tokens (
-            token_id TEXT NOT NULL PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            name TEXT NOT NULL,
-            image TEXT,
-            market_cap BIGINT,
-            market_cap_rank BIGINT,
-            total_supply BIGINT,
-            max_supply BIGINT,
-            ath BIGINT,
-            ath_date TEXT,
-            atl BIGINT,
-            atl_date TEXT,
-            last_updated TEXT,
-            last_synced TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            INDEX (symbol),
-        );
-
-
-
-
+    token_id TEXT NOT NULL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    name TEXT NOT NULL,
+    image TEXT,
+    market_cap BIGINT,
+    market_cap_rank BIGINT,
+    total_supply BIGINT,
+    max_supply BIGINT,
+    ath BIGINT,
+    ath_date TEXT,
+    atl BIGINT,
+    atl_date TEXT,
+    last_updated TEXT,
+    INDEX (symbol),
+);

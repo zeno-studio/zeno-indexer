@@ -60,13 +60,8 @@ impl PostgresDb {
     }
 
     pub async fn init_database(&self) -> Result<(), StatusCode> {
-        // Read schema.sql file 嵌入式 SQL：使用include_str！schema.sql包含在二进制文件中，消除运行时文件依赖性。
-
-        const SCHEMA_SQL: &str = include_str!("db/schema.sql");
-    
-        // Execute SQL statements
-        sqlx::query(&SCHEMA_SQL)
-            .execute(&self.pool)
+        sqlx::migrate!("./migrations")
+        .run(&self.pool)
             .await
             .map_err(|e| {
                 println!("Failed to execute schema.sql: {}", e);
