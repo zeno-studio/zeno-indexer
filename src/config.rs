@@ -147,7 +147,7 @@ pub struct Config {
     pub contract_address: String,
     pub abi_path: String,
     pub http_client: Client,
-    pub max_hot_token_page: i64,
+    pub max_token_indexed: i64,
 }
 
 impl Config {
@@ -172,7 +172,7 @@ impl Config {
             contract_address: env::var("CONTRACT_ADDRESS").expect("CONTRACT_ADDRESS must be set"),
             abi_path: env::var("ABI_PATH").expect("ABI_PATH must be set"),
             http_client: client,
-            max_hot_token_page: env::var("MAX_HOT_TOKEN_PAGE").expect("MAX_HOT_TOKEN_PAGE must be set").parse().unwrap(),
+            max_token_indexed: env::var("MAX_TOKEN_INDEXED").expect("MAX_TOKEN_INDEXED must be set").parse().unwrap_or(1000),
         }
     }
     pub async fn update_db_url(&mut self, new_url: String) -> Result<(), sqlx::Error> {

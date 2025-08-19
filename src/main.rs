@@ -12,7 +12,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
-use tracing_subscriber;
+use tracing_loki::BackgroundTask;
+use std::process;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_loki::url::Url;
 
 mod abi;
 mod config;
@@ -29,6 +33,7 @@ use manage::manager_rpc;
 use provider::eth::EthProvider;
 use wallet::local::Account;
 use worker::metadata::{fetch_token_metadata, sync_nftmap, sync_tokenmap};
+use worker::marketdata::sync_marketdata;
 
 #[tokio::main]
 
@@ -41,8 +46,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .install_default()
         .map_err(|e| format!("Failed to install rustls crypto provider: {:?}", e))?;
 
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+   //  Initialize tracing-loki
+   let (layer, task) = tracing_loki::builder()
+   .label("service", "indexer")?   // 
+   .build_url(Url::parse("http://127.0.0.1:3100").unwrap())?;
+
+    // We need to register our layer with `tracing`.
+    tracing_subscriber::registry()
+        .with(layer)
+        // One could add more layers here, for example logging to stdout:
+        // .with(tracing_subscriber::fmt::Layer::new())
+        .init();
+
+    // The background task needs to be spawned so the logs actually get
+    // delivered.
+    tokio::spawn(task);
+
+    tracing::info!(
+        task = "tracing_setup",
+        result = "success",
+        "tracing successfully set up",
+    );
 
     // Create Config and wrap in Arc<RwLock<...>>
     let config = Arc::new(RwLock::new(Config::from_env()));
@@ -89,6 +113,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
+
+
+    {
+        let config_clone = Arc::clone(&config);
+        tokio::spawn(async move {
+            let delay_secs = 300;
+            println!("⏳ First sync_nftmap will start in {delay_secs} seconds...");
+            sleep(Duration::from_secs(delay_secs)).await;
+            loop {
+                {
+                    let cfg = config_clone.read().await;
+                    if let Err(e) = fetch_token_metadata(&cfg).await {
+                        eprintln!("❌ fetch_token_metadata failed: {e}");
+                    }
+                }
+                sleep(Duration::from_secs(24 * 3600)).await; // 每天跑一次
+            }
+        });
+    }
+
     {
         let config_clone = Arc::clone(&config);
         tokio::spawn(async move {
@@ -110,8 +154,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize EVM Provider
     let provider = EthProvider::new(&config.read().await.eth_rpc_url).await?;
 
-    // Initialize ABI parser
-    let abi_parser = AbiParser::new(&config.read().await.abi_path)?;
 
     let account = Account::from_private_key(&config.read().await.private_key);
     info!("Account address: {}", account.unwrap().wallet.address());
