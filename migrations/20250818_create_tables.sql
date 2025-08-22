@@ -75,24 +75,3 @@ CREATE TABLE IF NOT EXISTS marketdata (
 CREATE INDEX IF NOT EXISTS idx_marketdata_symbol ON marketdata(symbol);
 CREATE INDEX IF NOT EXISTS idx_marketdata_token_id ON marketdata(token_id);
 
-
-CREATE TABLE IF NOT EXISTS daily_price (
-    id SERIAL PRIMARY KEY,
-    symbol TEXT NOT NULL,
-    data JSONB NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- 索引
-CREATE INDEX IF NOT EXISTS idx_daily_price_symbol ON daily_price(symbol);
-
-
-CREATE TABLE IF NOT EXISTS fifteen_minute_price (
-    id SERIAL PRIMARY KEY,
-    symbol TEXT NOT NULL UNIQUE,
-    prices JSONB NOT NULL,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- 索引
-CREATE INDEX IF NOT EXISTS idx_fifteen_price_symbol ON fifteen_minute_price(symbol);

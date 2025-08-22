@@ -3,7 +3,7 @@ use anyhow::Result;
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::Row;
+use sqlx::{Row, FromRow};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -15,12 +15,12 @@ const MAX_RETRY: u8 = 5;
 
 // ================== 请求重试封装 ==================
 async fn get_json_with_retry<T: serde::de::DeserializeOwned>(
-    client: &reqwest::Client,
+    config: &Config,
     url: &str,
-    headers: impl Fn(&reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    headers: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
 ) -> Result<T> {
     for attempt in 1..=MAX_RETRY {
-        let req = headers(&client.get(url));
+        let req = headers(config.http_client.get(url));
         match req.send().await {
             Ok(resp) => match resp.error_for_status() {
                 Ok(resp_ok) => return Ok(resp_ok.json::<T>().await?),
@@ -53,12 +53,11 @@ pub async fn sync_tokenmap(config: &Config) -> Result<()> {
         .collect();
 
     let url = "https://api.coingecko.com/api/v3/coins/list";
-    let tokens: Vec<CoinGeckoToken> = get_json_with_retry(&config.http_client, url, |r| {
+    let tokens: Vec<CoinGeckoToken> = get_json_with_retry(config, url, |r| {
         r.header("x-cg-demo-api-key", &config.coingecko_key)
             .header("Accept", "application/json")
             .query(&[("include_platform", "true")])
-    })
-    .await?;
+    }).await?;
 
     let mut inserted = 0;
     for token in tokens {
@@ -106,7 +105,6 @@ struct NftItem {
 pub async fn sync_nftmap(config: &Config) -> Result<()> {
     info!("Task sync_nftmap started");
     let pool = &config.postgres_db.pool;
-    let client = &config.http_client;
     let api_key = &config.coingecko_key;
 
     let chains: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>("SELECT name, chainid FROM chains")
@@ -120,7 +118,7 @@ pub async fn sync_nftmap(config: &Config) -> Result<()> {
 
     loop {
         let url = format!("https://api.coingecko.com/api/v3/nfts/list?per_page=250&page={}", page);
-        let resp: Vec<NftItem> = get_json_with_retry(client, &url, |r| {
+        let resp: Vec<NftItem> = get_json_with_retry(config, &url, |r| {
             r.header("x-cg-demo-api-key", api_key)
                 .header("Accept", "application/json")
         })
@@ -193,7 +191,7 @@ pub async fn fetch_token_metadata(config: &Config) -> Result<StatusCode, StatusC
         }
 
         let url = format!("https://api.coingecko.com/api/v3/coins/{}", token_id);
-        let resp: Value = get_json_with_retry(&config.http_client, &url, |r| {
+        let resp: Value = get_json_with_retry(config, &url, |r| {
             r.header("x-api-key", &config.coingecko_key)
                 .query(&[
                     ("localization", "false"),
@@ -319,7 +317,7 @@ pub async fn fetch_nft_metadata(config: &Config) -> Result<StatusCode, StatusCod
         }
 
         let url = format!("https://api.coingecko.com/api/v3/nfts/{}", nft_id);
-        let resp: Value = get_json_with_retry(&config.http_client, &url, |r| {
+        let resp: Value = get_json_with_retry(config, &url, |r| {
             r.header("x-api-key", &config.coingecko_key)
         })
         .await
@@ -386,3 +384,133 @@ pub async fn fetch_nft_metadata(config: &Config) -> Result<StatusCode, StatusCod
     Ok(StatusCode::OK)
 }
 
+
+#[derive(Debug, FromRow)]
+struct MetadataPartial {
+    id: i64,
+    chainid: i64,
+    address: String,
+    token_type: Option<String>,
+    is_verified: Option<bool>,
+    risk_level: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockscoutResponse {
+    is_contract: bool,
+    is_verified: bool,
+    is_scam: bool,
+    token: Option<TokenInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenInfo {
+    #[serde(rename = "type")]
+    token_type: Option<String>,
+}
+
+pub async fn update_metadata_from_blockscout(config: &Config) -> Result<()> {
+    let pool= &config.postgres_db.pool;
+    let client= &config.http_client;
+
+    let rows: Vec<MetadataPartial> = sqlx::query_as::<_, MetadataPartial>(
+        r#"
+        SELECT id, chainid, address, token_type, is_verified, risk_level
+        FROM metadata        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut updated_count = 0;
+    let mut fail_count_by_chain: HashMap<i64, usize> = HashMap::new();
+
+    for row in rows {
+        if row.token_type.is_some() && row.is_verified.is_some() && row.risk_level.is_some() {
+            continue;
+        }
+
+        // 从 config 里查找 API endpoint
+        let base_url = match config.blockscout_endpoints.get(&row.chainid) {
+            Some(url) => url,
+            None => continue, // 没配置的链跳过
+        };
+
+        let api_url = format!("{}/{}", base_url, row.address);
+
+        let resp = client
+            .get(&api_url)
+            .header("accept", "application/json")
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                warn!(chainid=row.chainid, status=?r.status(), "API 请求失败");
+                *fail_count_by_chain.entry(row.chainid).or_default() += 1;
+                continue;
+            }
+            Err(e) => {
+                warn!(chainid=row.chainid, error=?e, "HTTP 请求异常");
+                *fail_count_by_chain.entry(row.chainid).or_default() += 1;
+                continue;
+            }
+        };
+
+        let data: BlockscoutResponse = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(chainid=row.chainid, error=?e, "JSON 解析失败");
+                *fail_count_by_chain.entry(row.chainid).or_default() += 1;
+                continue;
+            }
+        };
+
+        if !data.is_contract {
+            continue;
+        }
+
+        let risk_level = if data.is_scam {
+            Some("scam".to_string())
+        } else {
+            None
+        };
+
+        let token_type = data.token.and_then(|t| t.token_type);
+
+        let result = sqlx::query(
+            r#"
+            UPDATE metadata
+            SET token_type = COALESCE($1, token_type),
+                is_verified = COALESCE($2, is_verified),
+                risk_level = COALESCE($3, risk_level),
+                updated_at = NOW()
+            WHERE id = $4
+            "#,
+        )
+        .bind(token_type)
+        .bind(Some(data.is_verified))
+        .bind(risk_level)
+        .bind(row.id)
+        .execute(pool)
+        .await;
+
+        match result {
+            Ok(_) => {
+                updated_count += 1;
+            }
+            Err(e) => {
+                error!(chainid=row.chainid, error=?e, "数据库更新失败");
+                *fail_count_by_chain.entry(row.chainid).or_default() += 1;
+            }
+        }
+    }
+
+    info!(updated = updated_count, "本次更新完成");
+
+    for (chainid, fails) in fail_count_by_chain {
+        warn!(chainid, fails, "API 或更新失败统计");
+    }
+
+    Ok(())
+}

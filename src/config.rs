@@ -1,9 +1,10 @@
-use std::env;
-use sqlx::{pool, postgres::PgPoolOptions, PgPool, Row};
-use reqwest::{Client,StatusCode};
-use tokio::time::Duration;
 use anyhow::Result;
-use std::fs;
+use reqwest::{Client, StatusCode};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use std::collections::HashMap;
+use std::env;
+use tokio::time::Duration;
+use tracing::{info, error};
 
 
 #[derive(Clone)]
@@ -25,14 +26,12 @@ impl PostgresDb {
     }
 
     pub async fn update_primary_db_url(&mut self, new_url: String) -> Result<(), sqlx::Error> {
-        // 健康检查：尝试连接新 URL
-
         let new_pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(&new_url)
             .await?;
 
-        // 检查是否为主节点（非恢复模式）
+        // 检查是否为主节点
         let is_in_recovery: bool = sqlx::query("SELECT pg_is_in_recovery()")
             .fetch_one(&new_pool)
             .await?
@@ -61,18 +60,18 @@ impl PostgresDb {
 
     pub async fn init_database(&self) -> Result<(), StatusCode> {
         sqlx::migrate!("./migrations")
-        .run(&self.pool)
+            .run(&self.pool)
             .await
             .map_err(|e| {
-                println!("Failed to execute schema.sql: {}", e);
+                error!("❌ Failed to execute schema.sql: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-    
-        println!("✅ Database initialized successfully from schema.sql.");
+
+        info!("✅ Database initialized successfully from schema.sql.");
         Ok(())
     }
 
-     pub async fn init_chains_table(&self) -> Result<()> {
+    pub async fn init_chains_table(&self) -> Result<()> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chains")
             .fetch_one(&self.pool)
             .await?;
@@ -94,15 +93,11 @@ impl PostgresDb {
                     .execute(&self.pool)
                     .await?;
             }
-            println!("Inserted default chains data.");
+            info!("Inserted default chains data.");
         }
         Ok(())
     }
 
- 
-        
-
-    /// 添加一个链
     pub async fn add_chain(&self, chainid: i64, name: &str) -> Result<()> {
         sqlx::query("INSERT INTO chains (chainid, name) VALUES ($1, $2)")
             .bind(chainid)
@@ -112,7 +107,6 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// 删除一个链
     pub async fn delete_chain(&self, chainid: i64) -> Result<()> {
         sqlx::query("DELETE FROM chains WHERE chainid = $1")
             .bind(chainid)
@@ -120,9 +114,10 @@ impl PostgresDb {
             .await?;
         Ok(())
     }
+
     pub async fn contract_exists(&self, address: &str, chainid: i64) -> Result<bool, sqlx::Error> {
         let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM metadata WHERE address = $1 AND chainid = $2 LIMIT 1"
+            "SELECT 1 FROM metadata WHERE address = $1 AND chainid = $2 LIMIT 1",
         )
         .bind(address)
         .bind(chainid)
@@ -131,54 +126,75 @@ impl PostgresDb {
 
         Ok(exists.is_some())
     }
-
- 
-
 }
 
-
+#[derive(Clone)]
 pub struct Config {
-    pub postgres_db: PostgresDb, 
+    pub postgres_db: PostgresDb,
     pub eth_rpc_url: String,
     pub manager_key: String,
     pub chainbase_key: String,
     pub coingecko_key: String,
-    pub private_key: String,
     pub contract_address: String,
     pub abi_path: String,
     pub http_client: Client,
     pub max_token_indexed: i64,
+    pub blockscout_endpoints: HashMap<i64, String>,
 }
 
 impl Config {
     pub fn from_env() -> Self {
         dotenvy::dotenv().ok();
-        let postgres_db = PostgresDb::new(env::var("MASTER_DATABASE_URL").expect("MASTER_DATABASE_URL must be set"));
+
+        let mut blockscout_endpoints = HashMap::new();
+        blockscout_endpoints.insert(1, "https://eth.blockscout.com/api/v2/addresses".to_string());
+        blockscout_endpoints.insert(10, "https://explorer.optimism.io/api/v2/addresses".to_string());
+        blockscout_endpoints.insert(42161, "https://arbitrum.blockscout.com/api/v2/addresses".to_string());
+        blockscout_endpoints.insert(8453, "https://base.blockscout.com/api/v2/addresses".to_string());
+        blockscout_endpoints.insert(137, "https://polygon.blockscout.com/api/v2/addresses".to_string());
+        blockscout_endpoints.insert(56, "https://kalyscan.io/api/v2/addresses".to_string());
+
+        let postgres_db = PostgresDb::new(
+            env::var("MASTER_DATABASE_URL").expect("MASTER_DATABASE_URL must be set"),
+        );
         let client = Client::builder()
-        .use_rustls_tls()
-        .http2_keep_alive_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(10))
-        .gzip(true) 
-        .brotli(true)
-        .build()
-        .map_err(|e| format!("Failed to build reqwest client: {}", e)).unwrap();
+            .use_rustls_tls()
+            .http2_keep_alive_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(10))
+            .gzip(true)
+            .brotli(true)
+            .build()
+            .map_err(|e| format!("Failed to build reqwest client: {}", e))
+            .unwrap();
+
         Config {
             postgres_db,
-            eth_rpc_url: env::var("eth_rpc_url").expect("eth_rpc_url must be set"),
-            manager_key: env::var("manager_key").expect("manager_key must be set"),
+            eth_rpc_url: env::var("ETH_RPC_URL").expect("ETH_RPC_URL must be set"),
+            manager_key: env::var("MANAGER_KEY").expect("MANAGER_KEY must be set"),
             chainbase_key: env::var("CHAINBASE_KEY").expect("CHAINBASE_KEY must be set"),
             coingecko_key: env::var("COINGECKO_KEY").expect("COINGECKO_KEY must be set"),
-            private_key: env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set"),
             contract_address: env::var("CONTRACT_ADDRESS").expect("CONTRACT_ADDRESS must be set"),
             abi_path: env::var("ABI_PATH").expect("ABI_PATH must be set"),
             http_client: client,
-            max_token_indexed: env::var("MAX_TOKEN_INDEXED").expect("MAX_TOKEN_INDEXED must be set").parse().unwrap_or(1000),
+            max_token_indexed: env::var("MAX_TOKEN_INDEXED")
+                .expect("MAX_TOKEN_INDEXED must be set")
+                .parse()
+                .unwrap_or(1000),
+            blockscout_endpoints,
         }
     }
+
     pub async fn update_db_url(&mut self, new_url: String) -> Result<(), sqlx::Error> {
         self.postgres_db.update_primary_db_url(new_url).await
     }
- 
 
+    /// 添加一个新的 blockscout endpoint
+    pub fn add_blockscout_endpoint(&mut self, chainid: i64, url: &str) {
+        self.blockscout_endpoints.insert(chainid, url.to_string());
+        info!("Added blockscout endpoint: chain {} -> {}", chainid, url);
+    }
+
+  
 }
 
+  
