@@ -75,3 +75,8 @@ CREATE TABLE IF NOT EXISTS marketdata (
 CREATE INDEX IF NOT EXISTS idx_marketdata_symbol ON marketdata(symbol);
 CREATE INDEX IF NOT EXISTS idx_marketdata_token_id ON marketdata(token_id);
 
+CREATE TABLE IF NOT EXISTS forex_rates (
+    created_at TIMESTAMP DEFAULT NOW(),
+    data JSONB NOT NULL
+);
+
