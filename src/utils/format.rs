@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 
 /// 检查 Ethereum 地址格式，如果合法则返回小写形式
-pub fn validate_eth_address(address: &str) -> Result<String> {
+pub fn validate_eth_address(address: &str) -> Result<()> {
     // 检查长度
     if address.len() != 42 {
         bail!("Invalid address length: expected 42, got {}", address.len());
