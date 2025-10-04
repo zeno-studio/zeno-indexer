@@ -1,5 +1,5 @@
-use anyhow::Result;
-use reqwest::{Client, StatusCode};
+use anyhow::{Result, Context};
+use reqwest::Client;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::collections::HashMap;
 use std::env;
@@ -58,14 +58,11 @@ impl PostgresDb {
         Ok(())
     }
 
-    pub async fn init_database(&self) -> Result<(), StatusCode> {
+    pub async fn init_database(&self) -> Result<()> {
         sqlx::migrate!("./migrations")
             .run(&self.pool)
             .await
-            .map_err(|e| {
-                error!("❌ Failed to execute schema.sql: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            .context("Failed to execute database migrations")?;
 
         info!("✅ Database initialized successfully from schema.sql.");
         Ok(())
@@ -135,11 +132,15 @@ pub struct Config {
     pub manager_key: String,
     pub chainbase_key: String,
     pub coingecko_key: String,
+    pub openexchangerates_key: String,
     pub contract_address: String,
     pub abi_path: String,
     pub http_client: Client,
     pub max_token_indexed: i64,
     pub blockscout_endpoints: HashMap<i64, String>,
+    pub metadata_interval_secs: u64,    // 默认 24*3600
+    pub marketdata_interval_secs: u64,  // 默认 24*3600
+    pub forex_interval_secs: u64,    
 }
 
 impl Config {
@@ -173,8 +174,21 @@ impl Config {
             manager_key: env::var("MANAGER_KEY").expect("MANAGER_KEY must be set"),
             chainbase_key: env::var("CHAINBASE_KEY").expect("CHAINBASE_KEY must be set"),
             coingecko_key: env::var("COINGECKO_KEY").expect("COINGECKO_KEY must be set"),
+            openexchangerates_key: env::var("OPENEXCHANGERATES_KEY").expect("OPENEXCHANGERATES must be set"),
             contract_address: env::var("CONTRACT_ADDRESS").expect("CONTRACT_ADDRESS must be set"),
             abi_path: env::var("ABI_PATH").expect("ABI_PATH must be set"),
+            metadata_interval_secs: env::var("METADATA_INTERVAL_SECS")
+                .expect("METADATA_INTERVAL_SECS must be set")
+                .parse()
+                .unwrap_or(24 * 3600),
+            marketdata_interval_secs: env::var("MARKETDATA_INTERVAL_SECS")
+                .expect("MARKETDATA_INTERVAL_SECS must be set")
+                .parse()
+                .unwrap_or(24 * 3600),
+            forex_interval_secs: env::var("FOREX_INTERVAL_SECS")
+                .expect("FOREX_INTERVAL_SECS must be set")
+                .parse()
+                .unwrap_or(3600),
             http_client: client,
             max_token_indexed: env::var("MAX_TOKEN_INDEXED")
                 .expect("MAX_TOKEN_INDEXED must be set")

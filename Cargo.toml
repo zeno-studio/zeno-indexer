@@ -7,7 +7,7 @@ license = "MIT"
 description = "A simple indexer application using Axum"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.100"
 axum = "0.8.4"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 http = "1.3.1"
