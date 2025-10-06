@@ -128,13 +128,9 @@ impl PostgresDb {
 #[derive(Clone)]
 pub struct Config {
     pub postgres_db: PostgresDb,
-    pub eth_rpc_url: String,
     pub manager_key: String,
-    pub chainbase_key: String,
     pub coingecko_key: String,
     pub openexchangerates_key: String,
-    pub contract_address: String,
-    pub abi_path: String,
     pub http_client: Client,
     pub max_token_indexed: i64,
     pub blockscout_endpoints: HashMap<i64, String>,
@@ -153,7 +149,6 @@ impl Config {
         blockscout_endpoints.insert(42161, "https://arbitrum.blockscout.com/api/v2/addresses".to_string());
         blockscout_endpoints.insert(8453, "https://base.blockscout.com/api/v2/addresses".to_string());
         blockscout_endpoints.insert(137, "https://polygon.blockscout.com/api/v2/addresses".to_string());
-        blockscout_endpoints.insert(56, "https://kalyscan.io/api/v2/addresses".to_string());
 
         let postgres_db = PostgresDb::new(
             env::var("MASTER_DATABASE_URL").expect("MASTER_DATABASE_URL must be set"),
@@ -170,13 +165,9 @@ impl Config {
 
         Config {
             postgres_db,
-            eth_rpc_url: env::var("ETH_RPC_URL").expect("ETH_RPC_URL must be set"),
             manager_key: env::var("MANAGER_KEY").expect("MANAGER_KEY must be set"),
-            chainbase_key: env::var("CHAINBASE_KEY").expect("CHAINBASE_KEY must be set"),
             coingecko_key: env::var("COINGECKO_KEY").expect("COINGECKO_KEY must be set"),
             openexchangerates_key: env::var("OPENEXCHANGERATES_KEY").expect("OPENEXCHANGERATES must be set"),
-            contract_address: env::var("CONTRACT_ADDRESS").expect("CONTRACT_ADDRESS must be set"),
-            abi_path: env::var("ABI_PATH").expect("ABI_PATH must be set"),
             metadata_interval_secs: env::var("METADATA_INTERVAL_SECS")
                 .expect("METADATA_INTERVAL_SECS must be set")
                 .parse()
