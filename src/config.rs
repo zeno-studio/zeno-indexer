@@ -4,7 +4,7 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::collections::HashMap;
 use std::env;
 use tokio::time::Duration;
-use tracing::{info, error};
+use tracing::{info};
 
 
 #[derive(Clone)]
@@ -81,6 +81,7 @@ impl PostgresDb {
                 (56, "binance-smart-chain"),
                 (8453, "base"),
                 (42161, "arbitrum-one"),
+                (59144,"linea")
             ];
 
             for (chainid, name) in chains {
@@ -104,14 +105,6 @@ impl PostgresDb {
         Ok(())
     }
 
-    pub async fn delete_chain(&self, chainid: i64) -> Result<()> {
-        sqlx::query("DELETE FROM chains WHERE chainid = $1")
-            .bind(chainid)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     pub async fn contract_exists(&self, address: &str, chainid: i64) -> Result<bool, sqlx::Error> {
         let exists: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM metadata WHERE address = $1 AND chainid = $2 LIMIT 1",
@@ -128,19 +121,13 @@ impl PostgresDb {
 #[derive(Clone)]
 pub struct Config {
     pub postgres_db: PostgresDb,
-    pub eth_rpc_url: String,
     pub manager_key: String,
-    pub chainbase_key: String,
     pub coingecko_key: String,
     pub openexchangerates_key: String,
-    pub contract_address: String,
-    pub abi_path: String,
     pub http_client: Client,
-    pub max_token_indexed: i64,
     pub blockscout_endpoints: HashMap<i64, String>,
-    pub metadata_interval_secs: u64,    // 默认 24*3600
-    pub marketdata_interval_secs: u64,  // 默认 24*3600
     pub forex_interval_secs: u64,    
+    pub is_initializing_metadata: bool,
 }
 
 impl Config {
@@ -153,7 +140,6 @@ impl Config {
         blockscout_endpoints.insert(42161, "https://arbitrum.blockscout.com/api/v2/addresses".to_string());
         blockscout_endpoints.insert(8453, "https://base.blockscout.com/api/v2/addresses".to_string());
         blockscout_endpoints.insert(137, "https://polygon.blockscout.com/api/v2/addresses".to_string());
-        blockscout_endpoints.insert(56, "https://kalyscan.io/api/v2/addresses".to_string());
 
         let postgres_db = PostgresDb::new(
             env::var("MASTER_DATABASE_URL").expect("MASTER_DATABASE_URL must be set"),
@@ -170,30 +156,18 @@ impl Config {
 
         Config {
             postgres_db,
-            eth_rpc_url: env::var("ETH_RPC_URL").expect("ETH_RPC_URL must be set"),
             manager_key: env::var("MANAGER_KEY").expect("MANAGER_KEY must be set"),
-            chainbase_key: env::var("CHAINBASE_KEY").expect("CHAINBASE_KEY must be set"),
             coingecko_key: env::var("COINGECKO_KEY").expect("COINGECKO_KEY must be set"),
             openexchangerates_key: env::var("OPENEXCHANGERATES_KEY").expect("OPENEXCHANGERATES must be set"),
-            contract_address: env::var("CONTRACT_ADDRESS").expect("CONTRACT_ADDRESS must be set"),
-            abi_path: env::var("ABI_PATH").expect("ABI_PATH must be set"),
-            metadata_interval_secs: env::var("METADATA_INTERVAL_SECS")
-                .expect("METADATA_INTERVAL_SECS must be set")
+            is_initializing_metadata: env::var("IS_INITIALIZING_METADATA")
+                .expect("IS_INITIALIZING_METADATA must be set")
                 .parse()
-                .unwrap_or(24 * 3600),
-            marketdata_interval_secs: env::var("MARKETDATA_INTERVAL_SECS")
-                .expect("MARKETDATA_INTERVAL_SECS must be set")
-                .parse()
-                .unwrap_or(24 * 3600),
+                .unwrap_or(true),
             forex_interval_secs: env::var("FOREX_INTERVAL_SECS")
                 .expect("FOREX_INTERVAL_SECS must be set")
                 .parse()
                 .unwrap_or(3600),
             http_client: client,
-            max_token_indexed: env::var("MAX_TOKEN_INDEXED")
-                .expect("MAX_TOKEN_INDEXED must be set")
-                .parse()
-                .unwrap_or(1000),
             blockscout_endpoints,
         }
     }
@@ -203,9 +177,15 @@ impl Config {
     }
 
     /// 添加一个新的 blockscout endpoint
-    pub fn add_blockscout_endpoint(&mut self, chainid: i64, url: &str) {
-        self.blockscout_endpoints.insert(chainid, url.to_string());
-        info!("Added blockscout endpoint: chain {} -> {}", chainid, url);
+    pub fn add_blockscout_endpoint(&mut self, chainid: i64, url: String)-> Result<(), sqlx::Error> {
+        self.blockscout_endpoints.insert(chainid, url.clone());
+        info!("Added blockscout endpoint: chain {} -> {}", chainid, url.clone());
+        Ok(())
+    }
+
+    pub fn set_is_initializing_metadata(&mut self, is_initializing_metadata: bool) {
+        self.is_initializing_metadata = is_initializing_metadata;
+        info!("Set is_initializing_metadata to {}", is_initializing_metadata)
     }
 
   
