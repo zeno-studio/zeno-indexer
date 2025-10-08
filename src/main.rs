@@ -11,6 +11,8 @@ mod config;
 mod manage;
 mod worker;
 mod tasks; 
+mod utils;
+
 
 use config::Config;
 use manage::manager_rpc;
@@ -41,18 +43,23 @@ async fn main() -> Result<()> {
     }
 
     // ========= 启动后台任务 =========
-    {
+    tokio::spawn({
         let cfg = config.clone();
-        tokio::spawn(async move {
-            start_all_tasks(cfg).await;
-        });
-    }
+        async move {
+            start_all_tasks(cfg.clone()).await;
+            {
+                let mut c = cfg.write().await;
+                c.set_is_initializing_metadata(false);
+                info!("🔧 Initialization complete");
+            }
+        }
+    });
   
     // ========= 启动 HTTP 服务 =========
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/manager", post(manager_rpc))
-        .with_state(Arc::clone(&config));
+        .with_state(config);
 
     let addr: SocketAddr = "0.0.0.0:8443".parse()?;
     let tls_config = load_tls_config().await?;

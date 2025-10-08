@@ -13,14 +13,6 @@ pub struct RpcRequest {
     pub params: serde_json::Value,
 }
 
-// 必须用 write().await
-// 因为 update_primary_db_url 会修改 Config 里的 postgres_db（它包含 pool）。
-
-// manager_key 验证在统一入口做
-// 不必每个方法重复验证。
-
-// RPC 兼容性
-// 只要 handler 支持 RwLock<Config>，读操作用 read()，写操作用 write()，这个 RPC 风格就可以同时管理数据库和配置本身。
 
 pub async fn manager_rpc(
     State(config): State<Arc<RwLock<Config>>>,
@@ -47,10 +39,10 @@ pub async fn manager_rpc(
                 Json(json!({"error": "Invalid params"}))
             }
         }
-        "delete_chain" => {
-            if let Some(chainid) = parse_delete_chain_params(&req.params) {
-                let cfg = config.read().await;
-                match cfg.postgres_db.delete_chain(chainid).await {
+        "add blockscout endpoin"=> {
+            if let Some((chainid, url)) = parse_add_blockscout_endpoint_params(&req.params) {
+                let mut cfg = config.write().await;
+                match cfg.add_blockscout_endpoint(chainid, url) {
                     Ok(_) => Json(json!({"result": "ok"})),
                     Err(e) => Json(json!({"error": e.to_string()})),
                 }
@@ -76,12 +68,15 @@ pub async fn manager_rpc(
 fn parse_add_chain_params(params: &serde_json::Value) -> Option<(i64, String)> {
     Some((
         params.get("chainid")?.as_i64()?,
-        params.get("name")?.as_str()?.to_string(),
+        params.get("url")?.as_str()?.to_string(),
     ))
 }
 
-fn parse_delete_chain_params(params: &serde_json::Value) -> Option<i64> {
-    params.get("chainid")?.as_i64()
+fn parse_add_blockscout_endpoint_params(params: &serde_json::Value) -> Option<(i64, String)> {
+    Some((
+        params.get("chainid")?.as_i64()?,
+        params.get("url")?.as_str()?.to_string(),
+    ))
 }
 
 fn parse_update_url_params(params: &serde_json::Value) -> Option<String> {

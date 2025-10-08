@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS metadata (
     UNIQUE(address, chainid)
 );
 
--- 索引
+
 CREATE INDEX IF NOT EXISTS idx_metadata_symbol ON metadata(symbol);
 CREATE INDEX IF NOT EXISTS idx_metadata_token_type ON metadata(token_type);
 
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS marketdata (
     last_updated TEXT
 );
 
--- 索引
+
 CREATE INDEX IF NOT EXISTS idx_marketdata_symbol ON marketdata(symbol);
 CREATE INDEX IF NOT EXISTS idx_marketdata_token_id ON marketdata(token_id);
 

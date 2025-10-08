@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::worker::{
     forex::update_forex,
     marketdata::sync_marketdata,
-    metadata::{fetch_token_metadata, sync_nftmap, sync_tokenmap, update_metadata_from_blockscout},
+    metadata::{fetch_token_metadata,fetch_nft_metadata,sync_nftmap, sync_tokenmap, update_metadata_from_blockscout, SyncMode},
 };
 
 /// 通用安全任务执行器
@@ -49,7 +49,15 @@ async fn metadata_task(cfg: Arc<RwLock<Config>>) {
             let cfg = cfg.clone();
             move || async move {
                 let cfg_read = cfg.read().await;
-                fetch_token_metadata(&*cfg_read).await
+                fetch_token_metadata(&*cfg_read, SyncMode::Insert).await
+            }
+        }).await;
+
+        safe_run("fetch_nft_metadata", {
+            let cfg = cfg.clone();
+            move || async move {
+                let cfg_read = cfg.read().await;
+                fetch_nft_metadata(&*cfg_read, SyncMode::Insert).await
             }
         }).await;
 
@@ -61,7 +69,7 @@ async fn metadata_task(cfg: Arc<RwLock<Config>>) {
             }
         }).await;
 
-        let sleep_secs = cfg.read().await.metadata_interval_secs;
+        let sleep_secs = 24*3600;
         info!(total_elapsed=?pipeline_start.elapsed(), "✅ daily metadata pipeline finished, sleeping {}s...", sleep_secs);
         sleep(Duration::from_secs(sleep_secs)).await;
     }
@@ -80,7 +88,7 @@ async fn marketdata_task(cfg: Arc<RwLock<Config>>) {
             }
         }).await;
 
-        let sleep_secs = cfg.read().await.marketdata_interval_secs;
+        let sleep_secs = 24*3600;
         info!(elapsed=?start.elapsed(), "✅ daily marketdata finished, sleeping {}s...", sleep_secs);
         sleep(Duration::from_secs(sleep_secs)).await;
     }
