@@ -32,7 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_metadata_token_type ON metadata(token_type);
 
 CREATE TABLE IF NOT EXISTS tokenmap (
     id SERIAL PRIMARY KEY,
-    token_id TEXT NOT NULL,
+    tokenid TEXT NOT NULL,
     symbol TEXT NOT NULL,
     name TEXT NOT NULL,
     chainid BIGINT NOT NULL,
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS nftmap (
 
 CREATE TABLE IF NOT EXISTS marketdata (
     id SERIAL PRIMARY KEY,
-    token_id TEXT NOT NULL,
+    tokenid TEXT NOT NULL,
     symbol TEXT NOT NULL,
     name TEXT NOT NULL,
     image TEXT,
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS marketdata (
 
 
 CREATE INDEX IF NOT EXISTS idx_marketdata_symbol ON marketdata(symbol);
-CREATE INDEX IF NOT EXISTS idx_marketdata_token_id ON marketdata(token_id);
+CREATE INDEX IF NOT EXISTS idx_marketdata_tokenid ON marketdata(tokenid);
 
 CREATE TABLE IF NOT EXISTS forex_rates (
     created_at TIMESTAMP DEFAULT NOW(),

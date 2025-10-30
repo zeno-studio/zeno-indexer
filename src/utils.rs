@@ -5,11 +5,14 @@
 //! - HTTP request helpers with retry logic
 //! - JSON parsing utilities
 //! - Error handling wrappers
+//! - Rate limiting for API requests
 
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::sync::{Semaphore, Mutex};
+use tokio::time::{sleep, Instant};
 use crate::config::Config;
-use tracing::warn;
+use tracing::{warn, debug};
 
 // ======================= Types =======================
 
@@ -29,11 +32,165 @@ pub enum FetchResult<T> {
     Failed(String),
 }
 
-// ======================= HTTP Utilities =======================
+// ======================= Rate Limiter =======================
+
+/// Rate limiter using token bucket algorithm
+///
+/// Ensures API requests don't exceed specified rate limits (e.g., 30 requests/minute).
+/// Uses a semaphore-based token bucket pattern with automatic token refill.
+///
+/// # Algorithm
+/// - Initialize with N tokens (permits)
+/// - Each request consumes 1 token
+/// - Tokens refill at fixed intervals (e.g., every 2 seconds for 30/min rate)
+/// - If no tokens available, request waits until refill
+/// - Additionally enforces minimum interval between requests to prevent bursts
+///
+/// # Example
+/// ```no_run
+/// // Create limiter: 30 requests per minute
+/// let limiter = RateLimiter::new(30, Duration::from_secs(60));
+///
+/// // Wait for permission before making request
+/// limiter.acquire().await;
+/// make_api_call().await;
+/// ```
+#[derive(Clone)]
+pub struct RateLimiter {
+    /// Semaphore controlling available tokens
+    semaphore: Arc<Semaphore>,
+    /// Maximum tokens (requests) allowed in the time window
+    max_tokens: usize,
+    /// Time window for rate limiting (e.g., 60 seconds for "per minute")
+    refill_interval: Duration,
+    /// Minimum interval between consecutive requests (to prevent bursts)
+    min_request_interval: Duration,
+    /// Last request timestamp (protected by mutex)
+    last_request_time: Arc<Mutex<Option<Instant>>>,
+}
+
+impl RateLimiter {
+    /// Creates a new rate limiter
+    ///
+    /// # Arguments
+    /// * `max_requests` - Maximum requests allowed per time window
+    /// * `time_window` - Time window duration (e.g., Duration::from_secs(60) for per minute)
+    ///
+    /// # Example
+    /// ```no_run
+    /// // 30 requests per minute
+    /// let limiter = RateLimiter::new(30, Duration::from_secs(60));
+    /// ```
+    pub fn new(max_requests: usize, time_window: Duration) -> Self {
+        // Calculate minimum interval between requests to spread them evenly
+        // For 28 req/min: 60s / 28 = ~2.14s between requests
+        let min_request_interval = time_window.div_f64(max_requests as f64);
+        
+        let limiter = Self {
+            semaphore: Arc::new(Semaphore::new(max_requests)),
+            max_tokens: max_requests,
+            refill_interval: min_request_interval,
+            min_request_interval,
+            last_request_time: Arc::new(Mutex::new(None)),
+        };
+        
+        // Start background task to refill tokens
+        limiter.start_refill_task();
+        limiter
+    }
+
+    /// Starts background task that periodically refills tokens
+    ///
+    /// Refill strategy: Add 1 token every (time_window / max_requests) interval
+    /// For example: 30 req/min → add 1 token every 2 seconds
+    fn start_refill_task(&self) {
+        let semaphore = Arc::clone(&self.semaphore);
+        let refill_interval = self.refill_interval;
+        let max_tokens = self.max_tokens;
+
+        tokio::spawn(async move {
+            loop {
+                sleep(refill_interval).await;
+                
+                // Only add permit if not at max capacity
+                if semaphore.available_permits() < max_tokens {
+                    semaphore.add_permits(1);
+                    debug!("Rate limiter: token refilled ({}/{} available)", 
+                           semaphore.available_permits(), max_tokens);
+                }
+            }
+        });
+    }
+
+    /// Acquires a token (waits if none available)
+    ///
+    /// This call blocks until a token becomes available AND enforces minimum
+    /// interval between requests to prevent bursts.
+    ///
+    /// # Returns
+    /// Returns immediately when token is acquired (non-blocking after acquisition)
+    pub async fn acquire(&self) {
+        let available_before = self.semaphore.available_permits();
+        
+        // Log if we're running low on tokens
+        if available_before == 0 {
+            warn!("⚠️ Rate limiter exhausted, waiting for token refill...");
+        } else if available_before <= 5 {
+            warn!("⚠️ Rate limiter low: only {} tokens remaining", available_before);
+        }
+        
+        // First, acquire a token from the semaphore
+        let permit = self.semaphore.acquire().await.expect("Semaphore closed");
+        
+        // Then, enforce minimum interval between requests
+        let mut last_time = self.last_request_time.lock().await;
+        if let Some(last) = *last_time {
+            let elapsed = last.elapsed();
+            if elapsed < self.min_request_interval {
+                let wait_time = self.min_request_interval - elapsed;
+                debug!("Enforcing min interval: waiting {:?} before next request", wait_time);
+                sleep(wait_time).await;
+            }
+        }
+        
+        // Update last request time
+        *last_time = Some(Instant::now());
+        
+        // Log token consumption
+        let available_after = self.semaphore.available_permits();
+        debug!("Rate limiter: consumed token ({} → {} remaining)", 
+               available_before, available_after);
+        
+        // Immediately forget the permit to consume the token
+        permit.forget();
+    }
+
+    /// Tries to acquire a token without waiting
+    ///
+    /// # Returns
+    /// * `true` - Token acquired successfully
+    /// * `false` - No tokens available (rate limit reached)
+    #[allow(dead_code)]
+    pub fn try_acquire(&self) -> bool {
+        if let Ok(permit) = self.semaphore.try_acquire() {
+            permit.forget();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Gets the number of available tokens
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+}
 
 // ======================= HTTP Utilities =======================
 
-/// Fetches and parses JSON data with automatic retry logic
+// ======================= HTTP Utilities =======================
+
+/// Fetches and parses JSON data with automatic retry logic and rate limiting
 ///
 /// This function provides robust HTTP request handling with:
 /// - Automatic retries on failure
@@ -41,6 +198,7 @@ pub enum FetchResult<T> {
 /// - Consecutive failure tracking (circuit breaker pattern)
 /// - Empty response detection
 /// - Comprehensive error logging
+/// - Optional rate limiting for API quota management
 ///
 /// # Type Parameters
 /// * `T` - Type to deserialize JSON response into (must implement Deserialize)
@@ -51,6 +209,7 @@ pub enum FetchResult<T> {
 /// * `headers` - Function to add custom headers to the request
 /// * `max_retry` - Maximum number of retry attempts (total attempts, not retries)
 /// * `max_consecutive_fail` - Maximum consecutive failures before giving up (circuit breaker)
+/// * `rate_limiter` - Optional rate limiter to enforce API quotas (e.g., 30 req/min)
 ///
 /// # Returns
 /// * `FetchResult::Success(T)` - Successfully fetched and parsed data
@@ -58,13 +217,17 @@ pub enum FetchResult<T> {
 /// * `FetchResult::Failed(String)` - Failed after retries with error message
 ///
 /// # Retry Strategy
-/// - Exponential backoff: 300ms × attempt_number
+/// - Exponential backoff: 1000ms × attempt_number
 /// - Circuit breaker: Stops if consecutive failures reach threshold
 /// - Last attempt: No sleep delay after final failure
+/// - Rate limiting: Enforced before each request if limiter provided
 ///
 /// # Example
 /// ```no_run
-/// use crate::utils::get_json_with_retry;
+/// use crate::utils::{get_json_with_retry, RateLimiter};
+/// 
+/// // Create rate limiter: 30 requests per minute
+/// let limiter = RateLimiter::new(30, Duration::from_secs(60));
 /// 
 /// let result = get_json_with_retry::<MyType>(
 ///     &config,
@@ -72,6 +235,7 @@ pub enum FetchResult<T> {
 ///     |req| req.header("Authorization", "Bearer token"),
 ///     5,  // max 5 attempts
 ///     3,  // stop after 3 consecutive failures
+///     Some(&limiter),  // enforce rate limit
 /// ).await;
 /// ```
 pub async fn get_json_with_retry<T: serde::de::DeserializeOwned>(
@@ -80,9 +244,19 @@ pub async fn get_json_with_retry<T: serde::de::DeserializeOwned>(
     headers: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
     max_retry: usize,
     max_consecutive_fail: usize,
+    rate_limiter: Option<&RateLimiter>,
 ) -> FetchResult<T> {
     // Track consecutive failures for circuit breaker pattern
     let mut consecutive_fail = 0;
+
+    // Enforce rate limit ONCE before all retry attempts (if limiter provided)
+    // This ensures we only consume one token regardless of retries
+    if let Some(limiter) = rate_limiter {
+        debug!("Waiting for rate limiter token... (available: {})", 
+               limiter.available_permits());
+        limiter.acquire().await;
+        debug!("Rate limiter token acquired, proceeding with request (max {} retries)", max_retry);
+    }
 
     for attempt in 1..=max_retry {
         // Build and send HTTP request with custom headers
@@ -153,7 +327,7 @@ pub async fn get_json_with_retry<T: serde::de::DeserializeOwned>(
 
         // Exponential backoff, but skip sleep on last attempt
         if attempt < max_retry {
-            sleep(Duration::from_millis(300 * attempt as u64)).await;
+            sleep(Duration::from_millis(1000 * attempt as u64)).await;
         }
     }
 
@@ -235,16 +409,16 @@ mod tests {
     /// Test exponential backoff calculation
     #[test]
     fn test_exponential_backoff_calculation() {
-        // Test backoff duration calculation
+        // Test backoff duration calculation (updated to 1000ms base)
         let backoff_durations: Vec<Duration> = (1..=5)
-            .map(|attempt| Duration::from_millis(300 * attempt as u64))
+            .map(|attempt| Duration::from_millis(1000 * attempt as u64))
             .collect();
 
-        assert_eq!(backoff_durations[0], Duration::from_millis(300));
-        assert_eq!(backoff_durations[1], Duration::from_millis(600));
-        assert_eq!(backoff_durations[2], Duration::from_millis(900));
-        assert_eq!(backoff_durations[3], Duration::from_millis(1200));
-        assert_eq!(backoff_durations[4], Duration::from_millis(1500));
+        assert_eq!(backoff_durations[0], Duration::from_millis(1000));
+        assert_eq!(backoff_durations[1], Duration::from_millis(2000));
+        assert_eq!(backoff_durations[2], Duration::from_millis(3000));
+        assert_eq!(backoff_durations[3], Duration::from_millis(4000));
+        assert_eq!(backoff_durations[4], Duration::from_millis(5000));
     }
 
     /// Test consecutive failure tracking
@@ -312,5 +486,57 @@ mod tests {
                 assert!(should_sleep, "Attempt {} should sleep", attempt);
             }
         }
+    }
+
+    /// Test rate limiter creation
+    #[tokio::test]
+    async fn test_rate_limiter_creation() {
+        let limiter = RateLimiter::new(30, Duration::from_secs(60));
+        assert_eq!(limiter.max_tokens, 30);
+        // Initial permits should be at max
+        assert_eq!(limiter.available_permits(), 30);
+    }
+
+    /// Test rate limiter try_acquire
+    #[tokio::test]
+    async fn test_rate_limiter_try_acquire() {
+        let limiter = RateLimiter::new(2, Duration::from_secs(10));
+        
+        // Should succeed when tokens available
+        assert!(limiter.try_acquire());
+        assert_eq!(limiter.available_permits(), 1);
+        
+        assert!(limiter.try_acquire());
+        assert_eq!(limiter.available_permits(), 0);
+        
+        // Should fail when no tokens
+        assert!(!limiter.try_acquire());
+    }
+
+    /// Test rate limiter refill interval calculation
+    #[test]
+    fn test_rate_limiter_refill_interval() {
+        // 30 requests per 60 seconds → 1 token every 2 seconds
+        let time_window = Duration::from_secs(60);
+        let max_requests = 30;
+        let expected_interval = time_window.div_f64(max_requests as f64);
+        
+        assert_eq!(expected_interval, Duration::from_secs(2));
+    }
+
+    /// Test async rate limiter acquire
+    #[tokio::test]
+    async fn test_rate_limiter_acquire() {
+        use tokio::time::Instant;
+        
+        let limiter = RateLimiter::new(2, Duration::from_secs(10));
+        
+        // First acquire should succeed immediately
+        let start = Instant::now();
+        limiter.acquire().await;
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(100), "Should be immediate");
+        
+        assert_eq!(limiter.available_permits(), 1);
     }
 }

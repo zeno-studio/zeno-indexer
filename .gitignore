@@ -1,3 +1,7 @@
 /target
 .env
 notice.md
+cert.pem
+key.pem
+openssl.cnf
+/docs

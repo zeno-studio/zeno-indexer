@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::env;
 use tokio::time::Duration;
 use tracing::info;
+use crate::utils::RateLimiter;
 
 /// Default maximum number of database connections in the pool
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
@@ -29,8 +30,6 @@ impl PostgresDb {
     ///
     /// # Panics
     /// Panics if the database URL format is invalid
-    ///
-
     pub fn new(primary_db_url: String) -> Self {
         let pool = PgPoolOptions::new()
             .max_connections(DEFAULT_MAX_CONNECTIONS)
@@ -142,8 +141,6 @@ impl PostgresDb {
         if count == 0 {
             let chains = vec![
                 (1, "ethereum"),
-                (10, "optimistic-ethereum"),
-                (137, "polygon-pos"),
                 (56, "binance-smart-chain"),
                 (8453, "base"),
                 (42161, "arbitrum-one"),
@@ -184,27 +181,6 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Checks if a contract exists in the metadata table
-    ///
-    /// # Arguments
-    /// * `address` - Contract address (lowercase hex string)
-    /// * `chainid` - Chain ID where contract is deployed
-    ///
-    /// # Returns
-    /// * `Ok(true)` - Contract exists
-    /// * `Ok(false)` - Contract not found
-    /// * `Err(sqlx::Error)` - Database query failed
-    pub async fn contract_exists(&self, address: &str, chainid: i64) -> Result<bool, sqlx::Error> {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM metadata WHERE address = $1 AND chainid = $2 LIMIT 1",
-        )
-        .bind(address)
-        .bind(chainid)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(exists.is_some())
-    }
 }
 
 /// Application configuration
@@ -233,6 +209,9 @@ pub struct Config {
     pub token_update_id: i64,
     /// Last processed NFT ID for incremental updates
     pub nft_update_id: i64,
+    /// Shared rate limiter for CoinGecko API calls (28 requests per minute)
+    /// This ensures all functions calling CoinGecko API share the same rate limit
+    pub coingecko_rate_limiter: RateLimiter,
 }
 
 impl Config {
@@ -263,10 +242,8 @@ impl Config {
         // Initialize Blockscout endpoints for supported chains
         let mut blockscout_endpoints = HashMap::new();
         blockscout_endpoints.insert(1, "https://eth.blockscout.com/api/v2/addresses".to_string());
-        blockscout_endpoints.insert(10, "https://explorer.optimism.io/api/v2/addresses".to_string());
         blockscout_endpoints.insert(42161, "https://arbitrum.blockscout.com/api/v2/addresses".to_string());
         blockscout_endpoints.insert(8453, "https://base.blockscout.com/api/v2/addresses".to_string());
-        blockscout_endpoints.insert(137, "https://polygon.blockscout.com/api/v2/addresses".to_string());
 
         // Initialize database connection
         let postgres_db = PostgresDb::new(
@@ -294,6 +271,10 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(3600);
 
+        // Create shared rate limiter for CoinGecko API
+        // 28 requests per minute to stay safely below the 30/min limit
+        let coingecko_rate_limiter = RateLimiter::new(28, Duration::from_secs(60));
+
         Config {
             postgres_db,
             manager_key: env::var("MANAGER_KEY").expect("MANAGER_KEY must be set"),
@@ -306,6 +287,7 @@ impl Config {
             is_initializing_metadata,
             token_update_id: 0,
             nft_update_id: 0,
+            coingecko_rate_limiter,
         }
     }
 

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -27,6 +27,7 @@ pub async fn sync_tokenmap(config: &Config) -> Result<()> {
         },
         5,
         3,
+        Some(&config.coingecko_rate_limiter),
     )
     .await;
 
@@ -49,7 +50,18 @@ pub async fn sync_tokenmap(config: &Config) -> Result<()> {
             .into_iter()
             .collect();
 
-    for token in tokens {
+    // Preload existing (address, chainid) pairs to avoid redundant inserts
+    // This significantly reduces DB round-trips for ON CONFLICT DO NOTHING.
+    let mut existing_pairs: HashSet<(String, i64)> =
+        sqlx::query_as::<_, (String, i64)>("SELECT address, chainid FROM tokenmap")
+            .fetch_all(pool)
+            .await
+            .context("Failed to load existing tokenmap pairs")?
+            .into_iter()
+            .collect();
+    let total_tokens = tokens.len();
+
+    for (t_idx, token) in tokens.iter().enumerate() {
         let tokenid = token.get("id").and_then(|v| v.as_str());
         let symbol = token.get("symbol").and_then(|v| v.as_str());
         let name = token.get("name").and_then(|v| v.as_str());
@@ -61,6 +73,7 @@ pub async fn sync_tokenmap(config: &Config) -> Result<()> {
         }
 
         for (platform, address_val) in platforms.unwrap() {
+            // Normalize address to lowercase
             let address = address_val.as_str().unwrap_or("").to_lowercase();
             if address.is_empty() {
                 skipped += 1;
@@ -70,6 +83,13 @@ pub async fn sync_tokenmap(config: &Config) -> Result<()> {
             let Some(chainid) = chains_map.get(platform) else {
                 continue;
             };
+
+            // Skip if (address, chainid) already exists in memory
+            let key = (address.clone(), *chainid);
+            if existing_pairs.contains(&key) {
+                skipped += 1;
+                continue;
+            }
 
             let res = sqlx::query(
                 r#"
@@ -87,7 +107,11 @@ pub async fn sync_tokenmap(config: &Config) -> Result<()> {
             .await;
 
             match res {
-                Ok(_) => inserted += 1,
+                Ok(_) => {
+                    inserted += 1;
+                    // Track newly inserted pair to avoid re-attempts within this run
+                    existing_pairs.insert(key);
+                }
                 Err(e) => warn!(
                     "Insert failed for token {}:{} => {}",
                     tokenid.unwrap(),
@@ -95,6 +119,17 @@ pub async fn sync_tokenmap(config: &Config) -> Result<()> {
                     e
                 ),
             }
+        }
+
+        // Progress logging every 1000 tokens to make long runs observable
+        if (t_idx + 1) % 1000 == 0 {
+            info!(
+                "Progress: processed {}/{} tokens, inserted {}, skipped {}",
+                t_idx + 1,
+                total_tokens,
+                inserted,
+                skipped
+            );
         }
     }
 
@@ -120,7 +155,18 @@ pub async fn sync_nftmap(config: &Config) -> Result<()> {
             .into_iter()
             .collect();
 
+    // Preload existing (address, chainid) pairs to avoid redundant inserts
+    // This significantly reduces DB round-trips for ON CONFLICT DO NOTHING.
+    let mut existing_pairs: HashSet<(String, i64)> =
+        sqlx::query_as::<_, (String, i64)>("SELECT address, chainid FROM nftmap")
+            .fetch_all(pool)
+            .await
+            .context("Failed to load existing nftmap pairs")?
+            .into_iter()
+            .collect();
+
     let mut page = 1usize;
+    let mut total_processed = 0usize;
 
     loop {
         let url = format!(
@@ -137,6 +183,7 @@ pub async fn sync_nftmap(config: &Config) -> Result<()> {
             },
             5,
             3,
+            Some(&config.coingecko_rate_limiter),
         )
         .await;
 
@@ -185,6 +232,13 @@ pub async fn sync_nftmap(config: &Config) -> Result<()> {
                 continue;
             };
 
+            // Skip if (address, chainid) already exists in memory
+            let key = (addr.clone(), *chainid);
+            if existing_pairs.contains(&key) {
+                skipped += 1;
+                continue;
+            }
+
             let res = sqlx::query(
                 r#"
                 INSERT INTO nftmap (nftid, symbol, name, chainid, address)
@@ -202,19 +256,30 @@ pub async fn sync_nftmap(config: &Config) -> Result<()> {
 
             if res.is_ok() {
                 inserted += 1;
+                // Track newly inserted pair to avoid re-attempts within this run
+                existing_pairs.insert(key);
             } else {
                 skipped += 1;
             }
         }
 
-        info!("✅ Processed page {}, total inserted {}", page, inserted);
+        total_processed += nfts.len();
+
+        // Progress logging every 5 pages (1250 NFTs) to make long runs observable
+        if page % 5 == 0 {
+            info!(
+                "Progress: page {}, processed {} NFTs, inserted {}, skipped {}",
+                page, total_processed, inserted, skipped
+            );
+        }
+
         page += 1;
         sleep(Duration::from_millis(300)).await;
     }
 
     info!(
-        "✅ sync_nftmap completed: inserted {}, skipped {}",
-        inserted, skipped
+        "✅ sync_nftmap completed: inserted {}, skipped {} (total {} NFTs processed)",
+        inserted, skipped, total_processed
     );
     Ok(())
 }
@@ -376,8 +441,24 @@ pub async fn fetch_token_metadata(config: &mut Config) -> Result<()> {
 
     // Start from last processed token ID (for incremental processing)
     let last_update_id = config.token_update_id;
+    let mut entry_consecutive_fail = 0;
+    let mut first_fail_id: Option<i32> = None; // Track first failure ID for rollback
+    // Preload all existing (address, chainid) pairs into HashSet for fast lookup
+    // This avoids N database queries and performs O(1) lookup in memory
+    let existing_metadata: HashSet<(String, i64)> =
+        sqlx::query_as::<_, (String, i64)>("SELECT address, chainid FROM metadata")
+            .fetch_all(pool)
+            .await
+            .context("Failed to preload existing metadata addresses")?
+            .into_iter()
+            .collect();
 
-    let tokenmap: Vec<(i64, String, String, i64, String)> = sqlx::query_as(
+    info!(
+        "📊 Preloaded {} existing metadata entries",
+        existing_metadata.len()
+    );
+
+    let tokenmap: Vec<(i32, String, String, i64, String)> = sqlx::query_as(
         "SELECT id, tokenid, name, chainid, address FROM tokenmap WHERE id > $1 ORDER BY id ASC",
     )
     .bind(last_update_id)
@@ -385,24 +466,19 @@ pub async fn fetch_token_metadata(config: &mut Config) -> Result<()> {
     .await
     .context("Failed to load tokenmap for metadata")?;
 
-    let mut max_id = last_update_id;
     let mut inserted = 0usize;
+    let mut skipped = 0usize;
     let total = tokenmap.len();
 
-    for (i, (id, token_id, _name, chainid, address)) in tokenmap.into_iter().enumerate() {
-        max_id = id; // Track current max ID for resume capability
-
+    for (i, (id, tokenid, _name, chainid, address)) in tokenmap.into_iter().enumerate() {
         // Skip tokens that already have metadata (daily sync only adds new ones)
-        if config
-            .postgres_db
-            .contract_exists(&address, chainid)
-            .await
-            .unwrap_or(false)
-        {
+        // Use in-memory HashSet lookup instead of database query for much better performance
+        if existing_metadata.contains(&(address.clone(), chainid)) {
+            skipped += 1;
             continue; // Metadata exists, skip to save API calls
         }
 
-        let url = format!("https://api.coingecko.com/api/v3/coins/{}", token_id);
+        let url = format!("https://api.coingecko.com/api/v3/coins/{}", tokenid);
         let result = get_json_with_retry::<Value>(
             config,
             &url,
@@ -419,6 +495,7 @@ pub async fn fetch_token_metadata(config: &mut Config) -> Result<()> {
             },
             5,
             3,
+            Some(&config.coingecko_rate_limiter),
         )
         .await;
 
@@ -428,7 +505,7 @@ pub async fn fetch_token_metadata(config: &mut Config) -> Result<()> {
                 let symbol = resp.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
                 let name = resp.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 if symbol.is_empty() || name.is_empty() {
-                    warn!("Skipping token {} with empty symbol/name", token_id);
+                    warn!("Skipping token {} with empty symbol/name", tokenid);
                     continue;
                 }
 
@@ -456,36 +533,51 @@ pub async fn fetch_token_metadata(config: &mut Config) -> Result<()> {
                     Ok(_) => {
                         inserted += 1;
                     }
-                    Err(e) => warn!("Insert failed for token {}: {}", token_id, e),
+                    Err(e) => warn!("Insert failed for token {}: {}", tokenid, e),
                 }
+                entry_consecutive_fail = 0;
+                first_fail_id = None; // Reset on success
             }
 
             FetchResult::Empty => {
-                warn!("⚠️ Token {} returned empty response", token_id);
+                warn!("⚠️ Token {} returned empty response", tokenid);
+                entry_consecutive_fail = 0;
+                first_fail_id = None; // Reset on empty (not a real failure)
             }
 
             FetchResult::Failed(e) => {
-                warn!(
-                    "❌ Failed to fetch token {} ({}/{}): {}",
-                    token_id,
-                    i + 1,
-                    total,
-                    e
-                );
-                // Update config to resume from this ID on next run
-                config.set_token_update_id(max_id);
-                return Err(anyhow!("API request failed for token {}: {}", token_id, e));
+                // Track first failure ID for accurate rollback
+                if entry_consecutive_fail == 0 {
+                    first_fail_id = Some(id);
+                }
+                entry_consecutive_fail += 1;
+                
+                if entry_consecutive_fail > 2 {
+                    warn!(
+                        "❌ Entry consecutive fail > 2, last token {} ({}/{}): {}",
+                        tokenid,
+                        i + 1,
+                        total,
+                        e
+                    );
+                    // Rollback to first failure ID to retry from there
+                    let rollback_id = first_fail_id.unwrap_or(id).saturating_sub(1).max(0);
+                    config.set_token_update_id(rollback_id as i64);
+                    return Err(anyhow!("API request failed for token {}: {}", tokenid, e));
+                }
+                warn!("⚠️ Skipping entry {} (consecutive fail: {})", tokenid, entry_consecutive_fail);
+                continue;
             }
         }
 
-        sleep(Duration::from_millis(300)).await;
+        // Rate limiting handled by rate_limiter, no additional sleep needed
     }
 
     info!(
-        "✅ Daily token metadata sync completed: {} new tokens inserted",
-        inserted
+        "✅ Daily token metadata sync completed: {} new tokens inserted, {} skipped",
+        inserted, skipped
     );
-    
+
     // Reset to 0 to indicate full completion (next run starts from beginning)
     config.set_token_update_id(0);
     Ok(())
@@ -539,10 +631,10 @@ pub async fn force_update_all_token_metadata(config: &Config) -> Result<()> {
 
     info!("📊 Total tokens to update: {}", total);
 
-    for (i, (id, token_id, _name, chainid, address)) in tokenmap.into_iter().enumerate() {
+    for (i, (id, tokenid, _name, chainid, address)) in tokenmap.into_iter().enumerate() {
         // NO skip check - force update all tokens
 
-        let url = format!("https://api.coingecko.com/api/v3/coins/{}", token_id);
+        let url = format!("https://api.coingecko.com/api/v3/coins/{}", tokenid);
         let result = get_json_with_retry::<Value>(
             config,
             &url,
@@ -567,9 +659,9 @@ pub async fn force_update_all_token_metadata(config: &Config) -> Result<()> {
                 let tokenid = resp.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let symbol = resp.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
                 let name = resp.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                
+
                 if symbol.is_empty() || name.is_empty() {
-                    warn!("Skipping token {} with empty symbol/name", token_id);
+                    warn!("Skipping token {} with empty symbol/name", tokenid);
                     failed += 1;
                     continue;
                 }
@@ -599,19 +691,19 @@ pub async fn force_update_all_token_metadata(config: &Config) -> Result<()> {
                         updated += 1;
                     }
                     Err(e) => {
-                        warn!("Force update failed for token {}: {}", token_id, e);
+                        warn!("Force update failed for token {}: {}", tokenid, e);
                         failed += 1;
                     }
                 }
             }
 
             FetchResult::Empty => {
-                warn!("⚠️ Token {} returned empty response", token_id);
+                warn!("⚠️ Token {} returned empty response", tokenid);
                 failed += 1;
             }
 
             FetchResult::Failed(e) => {
-                warn!("❌ Failed to fetch token {} ({}/{}): {}", token_id, i + 1, total, e);
+                warn!("❌ Failed to fetch token {} ({}/{}): {}", tokenid, i + 1, total, e);
                 failed += 1;
             }
         }
@@ -665,8 +757,25 @@ pub async fn fetch_nft_metadata(config: &mut Config) -> Result<()> {
     let pool = &config.postgres_db.pool;
 
     let last_update_id = config.nft_update_id;
+    let mut entry_consecutive_fail = 0;
+    let mut first_fail_id: Option<i32> = None; // Track first failure ID for rollback
 
-    let nftmap: Vec<(i64, String, String, i64, String)> = sqlx::query_as(
+    // Preload all existing (address, chainid) pairs into HashSet for fast lookup
+    // This avoids N database queries and performs O(1) lookup in memory
+    let existing_metadata: HashSet<(String, i64)> =
+        sqlx::query_as::<_, (String, i64)>("SELECT address, chainid FROM metadata")
+            .fetch_all(pool)
+            .await
+            .context("Failed to preload existing metadata addresses")?
+            .into_iter()
+            .collect();
+
+    info!(
+        "📊 Preloaded {} existing metadata entries",
+        existing_metadata.len()
+    );
+
+    let nftmap: Vec<(i32, String, String, i64, String)> = sqlx::query_as(
         "SELECT id, nftid, name, chainid, address FROM nftmap WHERE id > $1 ORDER BY id ASC",
     )
     .bind(last_update_id)
@@ -674,20 +783,15 @@ pub async fn fetch_nft_metadata(config: &mut Config) -> Result<()> {
     .await
     .context("Failed to load nftmap")?;
 
-    let mut max_id = last_update_id;
     let mut inserted = 0usize;
+    let mut skipped = 0usize;
     let total = nftmap.len();
 
     for (i, (id, nft_id, _name, chainid, address)) in nftmap.into_iter().enumerate() {
-        max_id = id;
-
         // Skip NFTs that already have metadata (daily sync only adds new ones)
-        if config
-            .postgres_db
-            .contract_exists(&address, chainid)
-            .await
-            .unwrap_or(false)
-        {
+        // Use in-memory HashSet lookup instead of database query for much better performance
+        if existing_metadata.contains(&(address.clone(), chainid)) {
+            skipped += 1;
             continue; // Metadata exists, skip to save API calls
         }
 
@@ -701,6 +805,7 @@ pub async fn fetch_nft_metadata(config: &mut Config) -> Result<()> {
             },
             5,
             3,
+            Some(&config.coingecko_rate_limiter),
         )
         .await;
 
@@ -738,34 +843,50 @@ pub async fn fetch_nft_metadata(config: &mut Config) -> Result<()> {
                     }
                     Err(e) => warn!("Insert failed for NFT {}: {}", nft_id, e),
                 }
+                entry_consecutive_fail = 0;
+                first_fail_id = None; // Reset on success
             }
 
             FetchResult::Empty => {
                 warn!("⚠️ NFT {} returned empty response", nft_id);
+                entry_consecutive_fail = 0;
+                first_fail_id = None; // Reset on empty (not a real failure)
             }
 
             FetchResult::Failed(e) => {
-                warn!(
-                    "❌ Failed to fetch NFT {} ({}/{}): {}",
-                    nft_id,
-                    i + 1,
-                    total,
-                    e
-                );
-                // Update config to resume from this ID on next run
-                config.set_nft_update_id(max_id);
-                return Err(anyhow!("API request failed for NFT {}: {}", nft_id, e));
+                // Track first failure ID for accurate rollback
+                if entry_consecutive_fail == 0 {
+                    first_fail_id = Some(id);
+                }
+                entry_consecutive_fail += 1;
+                
+                if entry_consecutive_fail > 2 {
+                    warn!(
+                        "❌ Entry consecutive fail > 2, last NFT {} ({}/{}): {}",
+                        nft_id,
+                        i + 1,
+                        total,
+                        e
+                    );
+                    // Rollback to first failure ID to retry from there
+                    let rollback_id = first_fail_id.unwrap_or(id).saturating_sub(1).max(0);
+                    config.set_nft_update_id(rollback_id as i64);
+                    return Err(anyhow!("API request failed for NFT {}: {}", nft_id, e));
+                }
+                
+                warn!("⚠️ Skipping entry {} (consecutive fail: {})", nft_id, entry_consecutive_fail);
+                continue;
             }
         }
 
-        sleep(Duration::from_millis(300)).await;
+        // Rate limiting handled by rate_limiter, no additional sleep needed
     }
 
     info!(
-        "✅ Daily NFT metadata sync completed: {} new NFTs inserted",
-        inserted
+        "✅ Daily NFT metadata sync completed: {} new NFTs inserted, {} skipped",
+        inserted, skipped
     );
-    
+
     // Reset to 0 to indicate full completion (next run starts from beginning)
     config.set_nft_update_id(0);
     Ok(())
@@ -825,7 +946,7 @@ pub async fn force_update_all_nft_metadata(config: &Config) -> Result<()> {
             FetchResult::Success(resp) => {
                 let symbol = resp.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
                 let name = resp.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                
+
                 if symbol.is_empty() || name.is_empty() {
                     warn!("NFT {} has empty symbol/name, skipping", nft_id);
                     failed += 1;
@@ -905,7 +1026,7 @@ pub async fn force_update_all_nft_metadata(config: &Config) -> Result<()> {
 #[derive(Debug, sqlx::FromRow)]
 struct MetadataPartial {
     /// Database row ID
-    id: i64,
+    id: i32,
     /// Blockchain chain ID
     chainid: i64,
     /// Contract address (lowercase hex)
@@ -984,7 +1105,6 @@ struct TokenInfo {
 /// - Non-contract addresses are silently skipped
 pub async fn update_metadata_from_blockscout(config: &Config) -> Result<()> {
     let pool = &config.postgres_db.pool;
-    let client = &config.http_client;
 
     // Step 1: Load all metadata records (only fetch fields we need to check)
     // This minimizes memory usage when dealing with large datasets
@@ -1007,7 +1127,7 @@ pub async fn update_metadata_from_blockscout(config: &Config) -> Result<()> {
     for (i, row) in rows.iter().enumerate() {
         // Step 2: Skip if all required fields already populated (optimization)
         // No need to call API if we already have complete data
-        if row.token_type.is_some() && row.is_verified.is_some() && row.risk_level.is_some() {
+        if row.token_type.is_some(){
             skipped_count += 1;
             continue;
         }
@@ -1024,53 +1144,33 @@ pub async fn update_metadata_from_blockscout(config: &Config) -> Result<()> {
 
         let api_url = format!("{}/{}", base_url.trim_end_matches('/'), row.address);
 
-        // Step 4: Call Blockscout API with retry mechanism (up to 3 attempts)
-        // Retries handle transient network issues and rate limiting
-        let mut resp_opt = None;
-        for attempt in 1..=3 {
-            match client
-                .get(&api_url)
-                .header("accept", "application/json")
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => {
-                    resp_opt = Some(r);
-                    break; // Success, exit retry loop
-                }
-                Ok(r) => {
-                    warn!(
-                        "⚠️ [chainid={}] attempt {}/3: HTTP {} for {}",
-                        row.chainid,
-                        attempt,
-                        r.status(),
-                        row.address
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ [chainid={}] attempt {}/3 failed for {}: {:?}",
-                        row.chainid, attempt, row.address, e
-                    );
-                }
-            }
-            // Wait before retry (exponential backoff could be added here)
-            sleep(Duration::from_millis(500)).await;
-        }
+        // Step 4: Call Blockscout API using get_json_with_retry
+        // This provides automatic retry logic, exponential backoff, and unified error handling
+        let result = get_json_with_retry::<BlockscoutResponse>(
+            config,
+            &api_url,
+            |r| r.header("accept", "application/json"),
+            3,    // max 3 retry attempts
+            3,    // stop after 3 consecutive failures
+            None, // no rate limiter needed for Blockscout
+        )
+        .await;
 
-        // All retry attempts failed, record and continue to next address
-        let Some(resp) = resp_opt else {
-            *fail_count_by_chain.entry(row.chainid).or_default() += 1;
-            continue;
-        };
-
-        // Step 5: Parse JSON response from Blockscout API
-        let data: BlockscoutResponse = match resp.json().await {
-            Ok(json) => json,
-            Err(e) => {
+        // Step 5: Handle API response
+        let data = match result {
+            FetchResult::Success(data) => data,
+            FetchResult::Empty => {
                 warn!(
-                    "⚠️ Failed to parse Blockscout JSON for {}: {:?}",
-                    row.address, e
+                    "⚠️ [chainid={}] Empty response for {}",
+                    row.chainid, row.address
+                );
+                *fail_count_by_chain.entry(row.chainid).or_default() += 1;
+                continue;
+            }
+            FetchResult::Failed(e) => {
+                warn!(
+                    "⚠️ [chainid={}] Failed to fetch {}: {}",
+                    row.chainid, row.address, e
                 );
                 *fail_count_by_chain.entry(row.chainid).or_default() += 1;
                 continue;
@@ -1092,11 +1192,7 @@ pub async fn update_metadata_from_blockscout(config: &Config) -> Result<()> {
         let token_type = data.token.as_ref().and_then(|t| t.token_type.clone());
         let is_verified = Some(data.is_verified);
 
-        // Step 8: Check if we have any new data to update
-        // Note: is_verified is always Some, so we always have at least one field to update
-        // This is intentional - we want to record verification status even if false
-
-        // Step 9: Update database with new information
+        // Step 8: Update database with new information
         // COALESCE ensures we don't overwrite existing data with NULL
         let res = sqlx::query(
             r#"
@@ -1110,7 +1206,7 @@ pub async fn update_metadata_from_blockscout(config: &Config) -> Result<()> {
             "#,
         )
         .bind(&token_type)
-        .bind(&is_verified)
+        .bind(is_verified)
         .bind(&risk_level)
         .bind(row.id)
         .execute(pool)

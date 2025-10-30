@@ -26,6 +26,7 @@ use crate::worker::{
 /// Daily task interval in seconds (24 hours)
 const DAILY_INTERVAL_SECS: u64 = 24 * 3600;
 
+
 // ======================= Task Runner =======================
 
 /// Generic safe task executor with error handling and timing
@@ -97,6 +98,7 @@ where
 /// - Uses write lock for metadata fetch tasks (to update progress tracking)
 /// - Uses read lock for other tasks (read-only operations)
 /// - Runs indefinitely until process termination
+  #[allow(dead_code)]
 async fn metadata_task(cfg: Arc<RwLock<Config>>) {
     // Track if this is the first run (for initialization)
     let mut is_first_run = cfg.read().await.is_initializing_metadata;
@@ -104,62 +106,77 @@ async fn metadata_task(cfg: Arc<RwLock<Config>>) {
     loop {
         let pipeline_start = Instant::now();
         
-        // Track success of all steps in this iteration
-        let mut all_steps_succeeded = true;
+        // Collect failed step names for summary logging
+        let mut failed_steps: Vec<&str> = Vec::new();
 
         // Step 1: Sync token mapping from CoinGecko API
-        // Populates tokenmap table with token addresses across all chains
-        all_steps_succeeded &= safe_run("sync_tokenmap", {
+        let s1 = safe_run("sync_tokenmap", {
             let cfg = cfg.clone();
             move || async move {
                 let cfg_read = cfg.read().await;
-                sync_tokenmap(&*cfg_read).await
+                sync_tokenmap(&cfg_read).await
             }
         }).await;
+        if !s1 { failed_steps.push("sync_tokenmap"); }
 
         // Step 2: Sync NFT mapping from CoinGecko API
-        // Populates nftmap table with NFT collection addresses
-        all_steps_succeeded &= safe_run("sync_nftmap", {
+        let s2 = safe_run("sync_nftmap", {
             let cfg = cfg.clone();
             move || async move {
                 let cfg_read = cfg.read().await;
-                sync_nftmap(&*cfg_read).await
+                sync_nftmap(&cfg_read).await
             }
         }).await;
+        if !s2 { failed_steps.push("sync_nftmap"); }
 
         // Step 3: Fetch metadata for new tokens (incremental)
-        // Uses write lock to update config.token_update_id for resume capability
-        all_steps_succeeded &= safe_run("fetch_token_metadata", {
+        let s3 = safe_run("fetch_token_metadata", {
             let cfg = cfg.clone();
             move || async move {
                 let mut cfg_write = cfg.write().await;
-                fetch_token_metadata(&mut *cfg_write).await
+                fetch_token_metadata(&mut cfg_write).await
             }
         }).await;
+        if !s3 { failed_steps.push("fetch_token_metadata"); }
 
         // Step 4: Fetch metadata for new NFTs (incremental)
-        // Uses write lock to update config.nft_update_id for resume capability
-        all_steps_succeeded &= safe_run("fetch_nft_metadata", {
+        let s4 = safe_run("fetch_nft_metadata", {
             let cfg = cfg.clone();
             move || async move {
                 let mut cfg_write = cfg.write().await;
-                fetch_nft_metadata(&mut *cfg_write).await
+                fetch_nft_metadata(&mut cfg_write).await
             }
         }).await;
+        if !s4 { failed_steps.push("fetch_nft_metadata"); }
 
         // Step 5: Update metadata with contract verification info from Blockscout
-        // Enriches existing metadata with verification status and risk assessment
-        all_steps_succeeded &= safe_run("update_metadata_from_blockscout", {
+        let s5 = safe_run("update_metadata_from_blockscout", {
             let cfg = cfg.clone();
             move || async move {
                 let cfg_read = cfg.read().await;
-                update_metadata_from_blockscout(&*cfg_read).await
+                update_metadata_from_blockscout(&cfg_read).await
             }
         }).await;
+        if !s5 { failed_steps.push("update_metadata_from_blockscout"); }
+
+        // Aggregate overall success
+        let all_steps_succeeded = s1 && s2 && s3 && s4 && s5;
+
+        // Summary logging for this iteration
+        if all_steps_succeeded {
+            info!(
+                total_elapsed=?pipeline_start.elapsed(),
+                "✅ metadata pipeline succeeded: all steps completed"
+            );
+        } else {
+            error!(
+                total_elapsed=?pipeline_start.elapsed(),
+                failed_steps=?failed_steps,
+                "❌ metadata pipeline had failures"
+            );
+        }
 
         // Step 6: Mark initialization as complete ONLY if all steps succeeded
-        // This ensures we don't incorrectly mark initialization as complete
-        // when there were failures that need to be retried
         if is_first_run && all_steps_succeeded {
             let mut cfg_write = cfg.write().await;
             cfg_write.set_is_initializing_metadata(false);
@@ -167,6 +184,72 @@ async fn metadata_task(cfg: Arc<RwLock<Config>>) {
             info!("🎉 Initial metadata synchronization completed successfully! Switching to incremental mode.");
         } else if is_first_run && !all_steps_succeeded {
             error!("⚠️ Initial metadata synchronization had failures. Will retry on next run.");
+        }
+
+        // Pipeline completed, sleep for 24 hours before next run
+        info!(
+            total_elapsed=?pipeline_start.elapsed(),
+            "✅ daily metadata pipeline finished, sleeping {}s...",
+            DAILY_INTERVAL_SECS
+        );
+        sleep(Duration::from_secs(DAILY_INTERVAL_SECS)).await;
+    }
+}
+// ... existing code ...
+
+
+async fn metadata_task1(cfg: Arc<RwLock<Config>>) {
+
+    loop {
+        let pipeline_start = Instant::now();
+        
+        // Collect failed step names for summary logging
+        let mut failed_steps: Vec<&str> = Vec::new();
+        // Step 3: Fetch metadata for new tokens (incremental)
+        // let s3 = safe_run("fetch_token_metadata", {
+        //     let cfg = cfg.clone();
+        //     move || async move {
+        //         let mut cfg_write = cfg.write().await;
+        //         fetch_token_metadata(&mut cfg_write).await
+        //     }
+        // }).await;
+        // if !s3 { failed_steps.push("fetch_token_metadata"); }
+
+        // // Step 4: Fetch metadata for new NFTs (incremental)
+        // let s4 = safe_run("fetch_nft_metadata", {
+        //     let cfg = cfg.clone();
+        //     move || async move {
+        //         let mut cfg_write = cfg.write().await;
+        //         fetch_nft_metadata(&mut cfg_write).await
+        //     }
+        // }).await;
+        // if !s4 { failed_steps.push("fetch_nft_metadata"); }
+
+        // Step 5: Update metadata with contract verification info from Blockscout
+        let s5 = safe_run("update_metadata_from_blockscout", {
+            let cfg = cfg.clone();
+            move || async move {
+                let cfg_read = cfg.read().await;
+                update_metadata_from_blockscout(&cfg_read).await
+            }
+        }).await;
+        if !s5 { failed_steps.push("update_metadata_from_blockscout"); }
+
+        // Aggregate overall success
+        let all_steps_succeeded = s5 ;
+
+        // Summary logging for this iteration
+        if all_steps_succeeded {
+            info!(
+                total_elapsed=?pipeline_start.elapsed(),
+                "✅ metadata pipeline succeeded: all steps completed"
+            );
+        } else {
+            error!(
+                total_elapsed=?pipeline_start.elapsed(),
+                failed_steps=?failed_steps,
+                "❌ metadata pipeline had failures"
+            );
         }
 
         // Pipeline completed, sleep for 24 hours before next run
@@ -202,6 +285,7 @@ async fn metadata_task(cfg: Arc<RwLock<Config>>) {
 ///
 /// # Arguments
 /// * `cfg` - Shared configuration (uses read lock for read-only access)
+  #[allow(dead_code)]
 async fn marketdata_task(cfg: Arc<RwLock<Config>>) {
     loop {
         let start = Instant::now();
@@ -211,7 +295,7 @@ async fn marketdata_task(cfg: Arc<RwLock<Config>>) {
             let cfg = cfg.clone();
             move || async move {
                 let cfg_read = cfg.read().await;
-                sync_marketdata(&*cfg_read).await
+                sync_marketdata(&cfg_read).await
             }
         }).await;
 
@@ -249,6 +333,7 @@ async fn marketdata_task(cfg: Arc<RwLock<Config>>) {
 ///
 /// # Arguments
 /// * `cfg` - Shared configuration (uses read lock to fetch interval setting)
+  #[allow(dead_code)]
 async fn forex_task(cfg: Arc<RwLock<Config>>) {
     loop {
         let start = Instant::now();
@@ -258,7 +343,7 @@ async fn forex_task(cfg: Arc<RwLock<Config>>) {
             let cfg = cfg.clone();
             move || async move {
                 let cfg_read = cfg.read().await;
-                update_forex(&*cfg_read).await
+                update_forex(&cfg_read).await
             }
         }).await;
 
@@ -314,9 +399,9 @@ async fn forex_task(cfg: Arc<RwLock<Config>>) {
 /// ```
 pub async fn start_all_tasks(cfg: Arc<RwLock<Config>>) {
     tokio::join!(
-        metadata_task(cfg.clone()),
-        marketdata_task(cfg.clone()),
-        forex_task(cfg)
+        metadata_task1(cfg.clone()),
+        // marketdata_task(cfg.clone()),
+        // forex_task(cfg)
     );
 }
 
@@ -445,8 +530,7 @@ mod tests {
         .await;
         assert!(!r3, "Custom error should return false");
 
-        // If we reach here, error logging didn't panic
-        assert!(true, "Error logging should not panic");
+        // Test completed successfully - error logging works correctly
     }
 
     /// Test all steps success tracking
@@ -480,7 +564,7 @@ mod tests {
         // Verify initial state
         {
             let cfg = config.read().await;
-            assert_eq!(cfg.is_initializing_metadata, true, "Should start with is_initializing_metadata = true");
+            assert!(cfg.is_initializing_metadata, "Should start with is_initializing_metadata = true");
         }
         
         // Simulate what metadata_task does after first run
@@ -492,7 +576,7 @@ mod tests {
         // Verify flag was changed
         {
             let cfg = config.read().await;
-            assert_eq!(cfg.is_initializing_metadata, false, "Should be false after initialization");
+            assert!(!cfg.is_initializing_metadata, "Should be false after initialization");
         }
     }
 }

@@ -94,7 +94,6 @@ async fn get_forex_with_retry(config: &Config) -> Result<Value> {
 /// 1. Fetches latest rates from OpenExchangeRates API
 /// 2. Truncates the existing table
 /// 3. Inserts new data with current timestamp
-
 pub async fn update_forex(config: &Config) -> Result<()> {
     let pool = &config.postgres_db.pool;
 

@@ -194,10 +194,12 @@ async fn main() -> Result<()> {
             .context("Failed to run database migrations")?;
         
         // Initialize chains table with default blockchain networks
-        cfg.postgres_db
+        if cfg.is_initializing_metadata {
+             cfg.postgres_db
             .init_chains_table()
             .await
             .context("Failed to initialize chains table")?;
+        }
         
         info!("✅ Database initialization complete");
     }

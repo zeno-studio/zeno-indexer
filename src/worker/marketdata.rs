@@ -1,18 +1,17 @@
 use crate::config::Config;
+use crate::utils::{FetchResult, get_json_with_retry};
 use anyhow::{Context, Result};
-use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
 use sqlx::{Postgres, QueryBuilder, Transaction, Executor};
-use std::time::Duration;
-use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Maximum number of retry attempts for API requests
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: usize = 3;
+/// Maximum consecutive failures before giving up
+const MAX_CONSECUTIVE_FAIL: usize = 3;
 /// Number of tokens to fetch per page
 const TOKENS_PER_PAGE: u32 = 250;
-/// Rate limit delay between API requests (milliseconds)
-const RATE_LIMIT_DELAY_MS: u64 = 300;
 
 /// Market data structure from CoinGecko API
 ///
@@ -58,11 +57,10 @@ pub struct MarketData {
 
 /// Fetches one page of market data from CoinGecko API
 ///
-/// Implements retry logic with exponential backoff for failed requests.
+/// Uses the shared rate limiter and get_json_with_retry utility for robust API calls.
 ///
 /// # Arguments
-/// * `client` - HTTP client for making requests
-/// * `api_key` - CoinGecko API key for authentication
+/// * `config` - Application configuration with HTTP client and rate limiter
 /// * `page` - Page number (1-indexed)
 ///
 /// # Returns
@@ -70,46 +68,40 @@ pub struct MarketData {
 /// * `Err(anyhow::Error)` - Request failed after all retries
 ///
 /// # Rate Limiting
-/// Uses CoinGecko free tier: 250 tokens per page
-async fn fetch_tokens_page(client: &Client, api_key: &str, page: u32) -> Result<Vec<MarketData>> {
+/// Uses shared CoinGecko rate limiter (28 requests per minute)
+async fn fetch_tokens_page(config: &Config, page: u32) -> Result<Vec<MarketData>> {
     let url = format!(
         "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&per_page={}&page={}",
         TOKENS_PER_PAGE, page
     );
 
-    let mut retries = MAX_RETRIES;
-    loop {
-        let resp = client
-            .get(&url)
-            .header("x-cg-demo-api-key", api_key)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .context("HTTP request failed")?;
+    let result = get_json_with_retry::<Value>(
+        config,
+        &url,
+        |r| {
+            r.header("x-cg-demo-api-key", &config.coingecko_key)
+                .header("Accept", "application/json")
+        },
+        MAX_RETRIES,
+        MAX_CONSECUTIVE_FAIL,
+        Some(&config.coingecko_rate_limiter),
+    )
+    .await;
 
-        // Check HTTP status
-        if !resp.status().is_success() {
-            retries -= 1;
-            if retries == 0 {
-                anyhow::bail!("Failed to fetch page {}: HTTP {}", page, resp.status());
-            }
-            warn!(
-                "HTTP {} on page {} (attempt {}/{}), retrying...",
-                resp.status(),
-                page,
-                MAX_RETRIES - retries,
-                MAX_RETRIES
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
+    match result {
+        FetchResult::Success(resp) => {
+            // Parse as array of MarketData
+            let tokens: Vec<MarketData> = serde_json::from_value(resp)
+                .context("Failed to parse market data from JSON")?;
+            Ok(tokens)
         }
-
-        // Parse JSON response
-        let tokens: Vec<MarketData> = resp
-            .json()
-            .await
-            .context("Failed to parse JSON from CoinGecko")?;
-        return Ok(tokens);
+        FetchResult::Empty => {
+            // Empty response means no more data
+            Ok(Vec::new())
+        }
+        FetchResult::Failed(e) => {
+            anyhow::bail!("Failed to fetch page {}: {}", page, e);
+        }
     }
 }
 
@@ -141,7 +133,7 @@ async fn insert_bulk_tokens(
     // Build bulk insert query
     let mut qb = QueryBuilder::<Postgres>::new(
         "INSERT INTO marketdata (
-            token_id, symbol, name, image, market_cap, market_cap_rank,
+            tokenid, symbol, name, image, market_cap, market_cap_rank,
             fully_diluted_valuation, price_change_24h, price_change_percentage_24h,
             circulating_supply, total_supply, max_supply, ath, ath_date,
             atl, atl_date, last_updated
@@ -154,17 +146,17 @@ async fn insert_bulk_tokens(
             .push_bind(&token.symbol)
             .push_bind(&token.name)
             .push_bind(&token.image)
-            .push_bind(&token.market_cap)
-            .push_bind(&token.market_cap_rank)
-            .push_bind(&token.fully_diluted_valuation)
-            .push_bind(&token.price_change_24h)
-            .push_bind(&token.price_change_percentage_24h)
-            .push_bind(&token.circulating_supply)
-            .push_bind(&token.total_supply)
-            .push_bind(&token.max_supply)
-            .push_bind(&token.ath)
+            .push_bind(token.market_cap)
+            .push_bind(token.market_cap_rank)
+            .push_bind(token.fully_diluted_valuation)
+            .push_bind(token.price_change_24h)
+            .push_bind(token.price_change_percentage_24h)
+            .push_bind(token.circulating_supply)
+            .push_bind(token.total_supply)
+            .push_bind(token.max_supply)
+            .push_bind(token.ath)
             .push_bind(&token.ath_date)
-            .push_bind(&token.atl)
+            .push_bind(token.atl)
             .push_bind(&token.atl_date)
             .push_bind(&token.last_updated);
     });
@@ -222,8 +214,8 @@ pub async fn sync_marketdata(config: &Config) -> Result<()> {
     let mut total_tokens = 0;
     
     loop {
-        // Fetch one page of data
-        let tokens = fetch_tokens_page(&config.http_client, &config.coingecko_key, page)
+        // Fetch one page of data (uses shared rate limiter)
+        let tokens = fetch_tokens_page(config, page)
             .await
             .with_context(|| format!("Failed to fetch page {}", page))?;
 
@@ -242,8 +234,8 @@ pub async fn sync_marketdata(config: &Config) -> Result<()> {
 
         page += 1;
         
-        // Rate limiting: wait before next request
-        sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
+        // Rate limiting is now handled by the shared rate limiter in get_json_with_retry
+        // No additional sleep needed here
     }
 
     // Commit all changes atomically
@@ -271,8 +263,8 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(MAX_RETRIES, 3);
+        assert_eq!(MAX_CONSECUTIVE_FAIL, 3);
         assert_eq!(TOKENS_PER_PAGE, 250);
-        assert_eq!(RATE_LIMIT_DELAY_MS, 300);
     }
 
     #[test]
